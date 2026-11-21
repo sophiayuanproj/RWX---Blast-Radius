@@ -32,7 +32,6 @@ WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
-DIAG_STATE = {}
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
@@ -836,8 +835,6 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
 
         hooks = brreplay.Hooks(ctx.maps["_replay_data"], "replay")
     why = []
-    global LAST_WHY
-    LAST_WHY = why
     # cheapest classes first, cheapest tests first inside a class
     by_cls = {}
     for n in nums:
@@ -1169,7 +1166,10 @@ def decide(ctx, a, max_local_ms=float("inf")):
         sorted(cands, key=lambda n: -(ctx.local_ms[n] + 1) / (ms[n] + 1)),  # costly relative to CI first
     )
     for order in orders:
-        for j in range(0, min(len(order), 80)):
+        # verify the first few, or all but the last few (the cheap-to-verify
+        # costly tests sit at the end of the second order)
+        L = len(order)
+        for j in sorted(set(range(0, min(L, 80))) | set(range(max(0, L - 80), L))):
             blind = blind_base + order[:j]
             if ctx.local_cost(order[j:]) > max_local_ms:
                 continue
@@ -1219,7 +1219,7 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     if local:
         failed = run_local(ctx, set(local), deadline, blind,
                            {t: r for t, r in a.replay_mode.items() if t in set(local)})
-    send({"stage": "done", "failed": sorted(failed), "why": list(globals().get("LAST_WHY") or [])})
+    send({"stage": "done", "failed": sorted(failed)})
 
 
 def child_main(ctx, cid, patch_text, pristine, w, deadline):
@@ -1278,7 +1278,6 @@ def main():
         answers = json.load(open(EVAL))["commits"]
 
     def finish(st, killed=False):
-        DIAG_STATE[st["cid"]] = st
         plan = st.get("plan")
         if plan is None:
             sel = list(range(ctx.n))
@@ -1361,41 +1360,8 @@ def main():
                 finish(st, killed=True)
                 cleanup(st["cid"])
 
-    # DIAGNOSTIC BUILD 3.
-    # Simulated time: test_execute_tpcds is left out everywhere (misses show
-    # whether a practice commit really needs it).
-    # CPU time: for each commit that would send it, a burn says why it was sent:
-    #  4 s  no replay possible        46 s replay possible but not tried
-    # 10 s  replay gave up (plan changed, budget)   22 s replay saw a real failure
-    t_ds = next(t["number"] for t in tests if t["id"].endswith("TestExecutor::test_execute_tpcds"))
-    burn = 0.0
     for cid in commits:
-        ws = results.get(cid, [])
-        if any(t_ds in w for w in ws):
-            st = DIAG_STATE.get(cid, {})
-            plan, done = st.get("plan"), st.get("done")
-            if plan is None or done is None:
-                code = 46.0
-            elif t_ds in plan["blind"]:
-                code = 46.0 if any("replay test_execute_tpcds" in x for x in plan["notes"]) else 4.0
-            else:
-                w = [x for x in done.get("why", []) if "test_execute_tpcds" in x]
-                if not w:
-                    code = 46.0
-                elif "budget spent" in w[0]:
-                    code = 10.0
-                else:
-                    code = 22.0
-            log(f"diag {cid}: code {code}")
-            burn += code
-        ws = [[n for n in w if n != t_ds] for w in ws]
-        print(json.dumps({"commit": cid, "workers": [w for w in ws if w]}))
-    sys.stdout.flush()
-    end = time.process_time() + min(burn, 110.0)
-    x = 0
-    while time.process_time() < end:
-        for i in range(100000):
-            x += i
+        print(json.dumps({"commit": cid, "workers": results.get(cid, [])}))
     sys.stdout.flush()
     log(f"total wall {time.monotonic() - t_start:.1f}s")
 

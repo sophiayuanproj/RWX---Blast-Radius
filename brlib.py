@@ -194,23 +194,38 @@ def apply_hunks(old_text, hunks):
 
 
 def changed_old_lines(hunks):
-    """Old-file line numbers touched by hunks (deleted lines, or the line
-    before an insertion)."""
+    """Old-file line numbers touched by hunks (deleted lines, or the lines
+    around an insertion). A block that replaces lines one for one, each new
+    line with the old line's indentation, touches only the old lines."""
     lines = set()
+
+    def ind(t):
+        return len(t) - len(t.lstrip(" \t"))
+
     for os_, ol, ns, nl, body in hunks:
         ln = os_ if ol > 0 else os_ + 1
-        for l in body:
-            if l.startswith("\\"):
-                continue
-            t = l[0]
+        body = [l for l in body if l and not l.startswith("\\")]
+        k = 0
+        while k < len(body):
+            t = body[k][0]
             if t == " ":
                 ln += 1
-            elif t == "-":
-                lines.add(ln)
-                ln += 1
-            elif t == "+":
-                lines.add(max(ln - 1, 1))
-                lines.add(ln)
+                k += 1
+                continue
+            # a block of consecutive changes
+            dels, adds, start = [], [], ln
+            while k < len(body) and body[k][0] in "-+":
+                (dels if body[k][0] == "-" else adds).append(body[k][1:])
+                k += 1
+            for x in range(len(dels)):
+                lines.add(start + x)
+            ln = start + len(dels)
+            if adds:
+                same = len(adds) == len(dels) and all(
+                    ind(a) == ind(d) and a.strip() and d.strip() for a, d in zip(adds, dels))
+                if not same:
+                    lines.add(max(ln - 1, 1))
+                    lines.add(ln)
     return lines
 
 
@@ -236,8 +251,22 @@ def _const_sig(c):
     return (type(c).__name__, repr(c))
 
 
+def _doc_index(co):
+    """0 if co_consts[0] is a function docstring (a str no instruction loads:
+    it only becomes __doc__, which no test reads), else None."""
+    if not is_function_code(co) or not co.co_consts or type(co.co_consts[0]) is not str:
+        return None
+    import dis
+
+    for ins in dis.get_instructions(co):
+        if ins.opcode in dis.hasconst and ins.arg == 0:
+            return None
+    return 0
+
+
 def shallow_sig(co):
     cls_body = (not is_function_code(co)) and "__firstlineno__" in co.co_names
+    doc = _doc_index(co)
     return (
         co.co_code,
         co.co_names,
@@ -251,8 +280,9 @@ def shallow_sig(co):
         co.co_stacksize,
         co.co_exceptiontable,
         tuple(
+            ("<doc>",) if i == doc else
             ("<firstlineno>",) if (cls_body and type(c) is int and c == co.co_firstlineno) else _const_sig(c)
-            for c in co.co_consts
+            for i, c in enumerate(co.co_consts)
         ),
     )
 
