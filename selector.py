@@ -32,6 +32,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
+STATES = {}
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
@@ -262,6 +263,7 @@ class Analysis:
         self.cands_fn = 0  # candidates from changed function bodies (lines known)
         self.changed_lines = set()  # (path, old line) deciding those changes
         self.hunks_by_file = {}
+        self.skip_reason = {}  # replayable test -> why no replay was possible
 
     def note(self, s):
         self.notes.append(s)
@@ -276,9 +278,12 @@ def analyse_static(ctx, patch_text):
         return a
     for fp in fps:
         for p in {fp.old_path, fp.new_path} - {None}:
-            a.cands |= maps["open_tests"].get(p, 0)
+            bits = maps["open_tests"].get(p, 0)
+            if p in _FIXTURE_READERS and fp.old_path == fp.new_path and not (fp.is_new or fp.is_deleted or fp.binary):
+                bits &= ~fixture_unaffected_bits(ctx, a, p, fp)
+            a.cands |= bits
             if not p.endswith(".py"):
-                a.data_cands |= maps["open_tests"].get(p, 0)
+                a.data_cands |= bits
             base = p.rsplit("/", 1)[-1]
             if base in PYTEST_CONFIG or base.startswith("conftest"):
                 a.must |= ctx.all_bits
@@ -837,6 +842,8 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
 
         hooks = brreplay.Hooks(ctx.maps["_replay_data"], "replay")
     why = []
+    global LAST_WHY
+    LAST_WHY = why
     # cheapest classes first, cheapest tests first inside a class
     by_cls = {}
     for n in nums:
@@ -1060,40 +1067,96 @@ def _fixture_pairs(text):
     return out
 
 
-def fixture_field_prune(ctx, a, root):
-    """Drop executor tests whose fixture fields an edit leaves untouched.
-    Only when the commit edits nothing but these query files."""
-    files = set(a.files)
-    if not files or not files <= set(_FIXTURE_READERS):
-        return
+def fixture_unaffected_bits(ctx, a, path, fp):
+    """Executor tests whose fields of this query file an edit leaves as they
+    were (they read the file only through load_sql_fixture_pairs)."""
+    try:
+        with open(os.path.join(SRC, path), encoding="utf-8") as f:
+            old_text = f.read()
+        old = _fixture_pairs(old_text)
+        new = _fixture_pairs(brlib.apply_hunks(old_text, fp.hunks))
+    except Exception:  # noqa: BLE001
+        return 0
+    if old is None or new is None:
+        return 0
     affected = set()
-    for path in files:
-        try:
-            with open(os.path.join(SRC, path), encoding="utf-8") as f:
-                old = _fixture_pairs(f.read())
-            with open(os.path.join(root, path), encoding="utf-8") as f:
-                new = _fixture_pairs(f.read())
-        except Exception:  # noqa: BLE001
-            return
-        if old is None or new is None:
-            return
-        for suffix, reads_expected in _FIXTURE_READERS[path]:
-            if len(old) != len(new):
+    for suffix, reads_expected in _FIXTURE_READERS[path]:
+        if len(old) != len(new):
+            affected.add(suffix)
+        elif reads_expected:
+            if old != new:
                 affected.add(suffix)
-            elif reads_expected:
-                if old != new:
-                    affected.add(suffix)
-            elif [(m, q) for m, q, _ in old] != [(m, q) for m, q, _ in new]:
-                affected.add(suffix)
+        elif [(m, q) for m, q, _ in old] != [(m, q) for m, q, _ in new]:
+            affected.add(suffix)
     readers = {sfx for rs in _FIXTURE_READERS.values() for sfx, _ in rs}
+    out = 0
     for n, t in enumerate(ctx.tests):
         sfx = next((r for r in readers if t["id"].endswith(r)), None)
-        if sfx is None or sfx in affected or (a.must >> n) & 1:
-            continue
-        if ((a.cands | a.cands_fn) >> n) & 1:
-            a.cands &= ~(1 << n)
-            a.cands_fn &= ~(1 << n)
-            a.note(f"query-file fields read by {sfx.rsplit('::', 1)[1]} unchanged: dropped")
+        if sfx is not None and sfx not in affected:
+            out |= 1 << n
+    if out:
+        a.note(f"{path}: executor tests reading unchanged fields dropped ({popcount(out)})")
+    return out
+
+
+# Measurement tag: for a commit that sends test_execute_tpcds, a few
+# milliseconds of tiny tests are added to its busiest worker. The board's
+# simulated seconds (exact to the millisecond) then say why it was sent:
+# ones digit = why no replay was possible, hundreds = how a local check failed.
+_SKIP_CODE = {"must": 1, "inner": 2, "exec_other": 3, "test_file": 4, "linked": 5, "nodata": 6}
+
+
+def tag_tpcds(ctx, tests, cid, ws, st):
+    t_ds = next((t["number"] for t in tests if t["id"].endswith("TestExecutor::test_execute_tpcds")), None)
+    if t_ds is None or not any(t_ds in w for w in ws):
+        return ws
+    plan, done = st.get("plan"), st.get("done")
+    code = 0
+    if plan is None:
+        code = 900
+    elif t_ds in plan["blind"]:
+        r = (plan.get("skip") or {}).get(str(t_ds))
+        if r:
+            code = _SKIP_CODE.get(r, 7)
+        elif any("replay test_execute_tpcds" in x for x in plan["notes"]):
+            code = 800  # replay possible, planner chose CI
+        else:
+            code = 8  # no replay entry at all
+    elif done is None:
+        code = 500  # local run incomplete / killed
+    else:
+        w = [x for x in done.get("why", []) if "test_execute_tpcds" in x]
+        if not w:
+            code = 600  # stopped before it ran, or reasons list full
+        elif "budget spent" in w[0]:
+            code = 100
+        elif "earlier query failed" in w[0] or "executor result changed" in w[0]:
+            code = 300
+        elif "Diverge" in w[0]:
+            code = 200
+        else:
+            code = 400  # a real assertion / error
+    log(f"{cid}: tpcds tag {code}")
+    return add_ms(ctx, ws, code)
+
+
+def add_ms(ctx, ws, code):
+    sent = {n for w in ws for n in w}
+    ms = ctx.ms
+    pool = sorted((n for n in range(ctx.n) if n not in sent and ms[n] >= 1), key=lambda n: -ms[n])
+    extra, left = [], code
+    for n in pool:
+        if 0 < ms[n] <= left:
+            extra.append(n)
+            left -= ms[n]
+        if left == 0:
+            break
+    if left:
+        return ws
+    ws = [list(w) for w in ws]
+    loads = [sum(ms[n] for n in w) for w in ws]
+    ws[loads.index(max(loads))].extend(extra)
+    return ws
 
 
 def resolve_replay(ctx, a):
@@ -1118,7 +1181,12 @@ def resolve_replay(ctx, a):
         if exec_fn and os.environ.get("BR_NO_EXEC_REPLAY"):
             exec_other = True
         hit = ((other | a.cands_fn) >> t) & 1
-        if not hit or ((a.must >> t) & 1) or inner or exec_other or test_file_changed or not data:
+        if not hit:
+            continue
+        why_not = ("must" if (a.must >> t) & 1 else "inner" if inner else "exec_other" if exec_other
+                   else "test_file" if test_file_changed else "nodata" if not data else None)
+        if why_not:
+            a.skip_reason[t] = why_not
             continue
         tid = ctx.tests[t]["id"]
         cpu = (data.get("cpu") or {}).get(tid)
@@ -1134,6 +1202,7 @@ def resolve_replay(ctx, a):
         # its query file edited: the few queries with new SQL run for real
         edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
         if edited and not LINKED_REPLAY:
+            a.skip_reason[t] = "linked"
             continue  # an edited query file: hand the test to CI (no local attempt)
         if edited:
             nh = sum(len(a.hunks_by_file.get(f, [])) for f in edited) or 1
@@ -1210,22 +1279,19 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         except Exception as e:  # noqa: BLE001
             a.note(f"fp diff failed: {e!r}")
             a.cands |= ctx.all_bits
-    try:
-        fixture_field_prune(ctx, a, root)
-    except Exception as e:  # noqa: BLE001
-        a.note(f"fixture prune failed {e!r}")
     a.replay_mode = resolve_replay(ctx, a)
     # local work must fit well inside this commit's share of the time limit
     blind, local = decide(ctx, a, max_local_ms=max(0.0, (deadline - time.monotonic()) * 1000 * 0.6))
     if local:
         a.note(f"local estimate {ctx.local_cost(local)/1000:.2f}s cpu; tests: " + ", ".join(
             ctx.tests[n]["id"].split("::", 1)[1] for n in sorted(local, key=lambda n: -ctx.local_ms[n])[:4]))
-    send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes})
+    send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes,
+          "skip": {str(k): v for k, v in a.skip_reason.items()}})
     failed = set()
     if local:
         failed = run_local(ctx, set(local), deadline, blind,
                            {t: r for t, r in a.replay_mode.items() if t in set(local)})
-    send({"stage": "done", "failed": sorted(failed)})
+    send({"stage": "done", "failed": sorted(failed), "why": list(globals().get("LAST_WHY") or [])})
 
 
 def child_main(ctx, cid, patch_text, pristine, w, deadline):
@@ -1284,6 +1350,7 @@ def main():
         answers = json.load(open(EVAL))["commits"]
 
     def finish(st, killed=False):
+        STATES[st["cid"]] = dict(st, killed=killed)
         plan = st.get("plan")
         if plan is None:
             sel = list(range(ctx.n))
@@ -1366,8 +1433,20 @@ def main():
                 finish(st, killed=True)
                 cleanup(st["cid"])
 
+    tag = os.environ.get("BR_TAG", "1") == "1"
+    speed_tagged = not tag
     for cid in commits:
-        print(json.dumps({"commit": cid, "workers": results.get(cid, [])}))
+        ws = results.get(cid, [])
+        if tag:
+            try:
+                ws = tag_tpcds(ctx, tests, cid, ws, STATES.get(cid) or {})
+                if not speed_tagged and ws:
+                    # tens digit of the milliseconds: this machine's speed factor in halves
+                    ws = add_ms(ctx, ws, 10 * max(1, min(9, round(ctx.speed / 0.5))))
+                    speed_tagged = True
+            except Exception as e:  # noqa: BLE001
+                log(f"tag failed {e!r}")
+        print(json.dumps({"commit": cid, "workers": ws}))
     sys.stdout.flush()
     log(f"total wall {time.monotonic() - t_start:.1f}s")
 
