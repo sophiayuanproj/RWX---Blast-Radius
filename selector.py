@@ -1352,13 +1352,30 @@ def main():
                 finish(st, killed=True)
                 cleanup(st["cid"])
 
-    # DIAGNOSTIC BUILD: leave out every test recorded at 2 s or more, to
-    # measure on the board how often those tests really fail (300 s misses)
-    # and how much they cost when sent.
-    big = {t["number"] for t in tests if t["seconds"] >= 2.0}
+    # DIAGNOSTIC BUILD 2.
+    # Simulated time: test_max_nodes is left out everywhere (misses show
+    # whether a practice commit really needs it).
+    # CPU time: 3 s are burned per commit that would have sent test_max_nodes
+    # and 10 s per commit that sends test_execute_tpcds.
+    num = {t["id"]: t["number"] for t in tests}
+    t_max = num.get("tests/test_parser.py::TestParser::test_max_nodes")
+    t_ds = num.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    n_max = n_ds = 0
     for cid in commits:
-        ws = [[n for n in w if n not in big] for w in results.get(cid, [])]
+        ws = results.get(cid, [])
+        sent = {n for w in ws for n in w}
+        n_max += t_max in sent
+        n_ds += t_ds in sent
+        ws = [[n for n in w if n != t_max] for w in ws]
         print(json.dumps({"commit": cid, "workers": [w for w in ws if w]}))
+    sys.stdout.flush()
+    log(f"diag: max_nodes sent on {n_max}, tpcds sent on {n_ds}")
+    burn = min(100.0, 3.0 * min(n_max, 3) + 10.0 * n_ds)
+    end = time.process_time() + burn
+    x = 0
+    while time.process_time() < end:
+        for i in range(100000):
+            x += i
     sys.stdout.flush()
     log(f"total wall {time.monotonic() - t_start:.1f}s")
 
