@@ -177,6 +177,7 @@ class Ctx:
         self.file_code_tests = mod_codes
         self.import_codes = maps["import_codes"]
         self.order_sensitive = maps.get("order_sensitive", set())
+        self._fq_classes = {(f, q.rsplit(".", 1)[0]) for (f, q) in self.fq_tests if "." in q}
         lc = maps.get("local_cpu") or [None] * self.n
         self.local_ms = []
         for i, t in enumerate(tests):
@@ -195,6 +196,10 @@ class Ctx:
             self.mod_of.append(mod)
             self.cls_of.append(mod + "." + rest.split("::")[0])
         self.lazy_load = [i for i, t in enumerate(tests) if t["id"].endswith("test_dialect.py::TestDialect::test_lazy_load")]
+
+    def fq_tests_has_class(self, mod, qual):
+        rel = mod.replace(".", "/")
+        return (rel + ".py", qual) in self._fq_classes or (rel + "/__init__.py", qual) in self._fq_classes
 
     def local_cost(self, nums):
         """Estimated CPU ms to run nums here."""
@@ -578,9 +583,53 @@ def fp_diff(ctx, a, pristine):
             fam = [ck] + maps["descendants"].get(ck, [])
             if o is None or n is None or o[0] != n[0]:
                 bits = 0
-                for c in fam:
-                    bits |= maps["touch"].get(c, 0)
-                bits |= maps["name_tests"].get(attr, 0) & bits_or_all(ctx, fam)
+                avt = maps.get("attr_via_tests")
+                rk = f"{mod}:{qual}.{attr}"
+                if avt is not None and (n or o)[0] == "D" and (o is None or o[0] == "D"):
+                    # a data attribute added (overriding an inherited one) or
+                    # removed: whoever read that name through the class or a
+                    # subclass, plus readers of the class's own old value
+                    for c in fam:
+                        bits |= avt.get((c, attr), 0)
+                    bits |= maps["read_tests"].get(rk, 0)
+                    if not bits:
+                        # nothing read this name through the family: a name new
+                        # to the family; tests using the family and the name
+                        fb = 0
+                        for c in fam:
+                            fb |= maps["touch"].get(c, 0)
+                        bits = fb & maps.get("name_attr_tests", maps["name_tests"]).get(attr, ctx.all_bits)
+                elif o is not None and o[0] == "F" and n is None:
+                    # a method removed: only calls that ran it now reach the parent
+                    rel = mod.replace(".", "/")
+                    for f in (rel + ".py", rel + "/__init__.py"):
+                        bits |= ctx.fq_tests.get((f, f"{qual}.{attr}"), 0)
+                    bits |= maps["read_tests"].get(rk, 0)
+                    if not bits and not ctx.fq_tests_has_class(mod, qual):
+                        for c in fam:
+                            bits |= maps["touch"].get(c, 0)
+                elif o is None and n is not None and n[0] == "F" and attr.endswith("_sql") \
+                        and (sql_bits := added_sql_method_tests(ctx, mod, qual, attr, fam)) is not None:
+                    bits = sql_bits
+                elif o is None and n is not None and n[0] == "F" and not attr.endswith("_sql"):
+                    # a method added: calls by name on the family, or calls that
+                    # ran an inherited version of it
+                    fb = 0
+                    for c in fam:
+                        fb |= maps["touch"].get(c, 0)
+                    names = maps.get("name_attr_tests", maps["name_tests"]).get(attr, 0)
+                    inh = 0
+                    cls = _resolve(mod, qual)
+                    for base in (cls.__mro__[1:] if isinstance(cls, type) else ()):
+                        if attr in base.__dict__:
+                            for f, q in brfp.func_qualnames(base.__dict__[attr]):
+                                relf = os.path.relpath(f, os.getcwd()) if os.path.isabs(f) else f
+                                inh |= ctx.fq_tests.get((relf, q), 0)
+                    bits = fb & (names | inh)
+                else:
+                    for c in fam:
+                        bits |= maps["touch"].get(c, 0)
+                    bits |= maps["read_tests"].get(rk, 0)
                 a.note(f"attr {ck}.{attr} added/removed/retyped -> {popcount(bits)}")
             elif tag == "D":
                 rk = f"{mod}:{qual}.{attr}"
@@ -647,6 +696,56 @@ def fp_diff(ctx, a, pristine):
                 a.note(f"test file {file} fails to import: {e!r}"[:200])
         a.note(f"{bad} test files fail to import")
     a.note(f"fp diff: {len(diffs)} keys, {time.process_time() - t0:.2f}s cpu")
+
+
+def added_sql_method_tests(ctx, mod, qual, attr, fam):
+    """A `<key>_sql` method added to a generator class: the generator reaches
+    it through its dispatch table for expressions of that key, whose lookups
+    were recorded as key reads of the TRANSFORMS they came from. None when
+    that does not hold (not a generator, binary expressions, unknown key)."""
+    import sys as _s
+
+    import brfp
+
+    maps = ctx.maps
+    exp = _s.modules.get("sqlglot.expressions")
+    gen = _s.modules.get("sqlglot.generator")
+    cls = _resolve(mod, qual)
+    if exp is None or gen is None or not isinstance(cls, type) or not issubclass(cls, gen.Generator):
+        return None
+    klass = getattr(exp, "EXPR_CLASSES", {}).get(attr[:-4])
+    if klass is None:
+        return None
+    binary = getattr(exp, "Binary", None)
+    if binary is not None and isinstance(klass, type) and issubclass(klass, binary):
+        return None  # nested binary nodes are generated by name, bypassing dispatch
+    reg = brfp.class_registry()
+    kfp = brfp._FP().h(klass)
+    kt = maps.get("key_tests") or {}
+    bits = 0
+    found = False
+    stack = [cls]
+    seen = set()
+    while stack:
+        c = stack.pop()
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        owner = next((b for b in c.__mro__ if "TRANSFORMS" in b.__dict__), None)
+        okey = reg.get(id(owner)) if owner is not None else None
+        if okey is None:
+            return None
+        found = True
+        bits |= kt.get((f"{okey}.TRANSFORMS", kfp), 0) | kt.get((f"{okey}.TRANSFORMS", "*"), 0)
+        stack.extend(type.__subclasses__(c))
+    if not found:
+        return None
+    # the TRANSFORMS read may be inherited from a class shared with other
+    # dialects: keep tests that used this family; add explicit calls by name
+    fb = 0
+    for c in fam:
+        fb |= maps["touch"].get(c, 0)
+    return fb & (bits | maps.get("name_attr_tests", maps["name_tests"]).get(attr, 0))
 
 
 def global_readers(ctx, mod, name, o, n):

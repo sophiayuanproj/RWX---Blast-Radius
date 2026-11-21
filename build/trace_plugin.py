@@ -365,6 +365,8 @@ def pytest_collection_finish(session):
     import sqlglot.executor.python as py
 
     py.PythonExecutor.execute = _outer(py.PythonExecutor.execute, "execr")
+    # table data handed to the executor: must be unaffected for replay
+    ex.ensure_tables = _outer(ex.ensure_tables, "data")
     mod = sys.modules.get(brreplay.TEST_MODULE)
     if mod is not None:
         for name in ("parse_one", "transpile"):

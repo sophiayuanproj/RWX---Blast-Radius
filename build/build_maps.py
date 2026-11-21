@@ -64,6 +64,7 @@ class_fixture = defaultdict(lambda: {f: set() for f in FIELDS})
 collect = {}
 outer = {}  # front-end coverage of replayable tests (see brreplay)
 execr = {}  # executor coverage of replayable tests
+data_region = {}  # table-data preparation inside replayable tests' calls
 unknown = set()
 for key, b in buckets.items():
     phase, _, rest = key.partition(":")
@@ -84,6 +85,8 @@ for key, b in buckets.items():
         outer[rest] = b
     elif phase == "execr":
         execr[rest] = b
+    elif phase == "data":
+        data_region[rest] = b
     elif phase not in ("<preimport>", "<import>", "<postimport>", "<between>") and not key.startswith("<"):
         raise SystemExit(f"unhandled trace bucket {key!r}: coverage would be lost")
 if unknown:
@@ -111,7 +114,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import brreplay  # noqa: E402
 
 next_pseudo = len(tests)
-for tid in set(execr) - set(brreplay.REPLAY_TESTS):
+for tid in (set(execr) | set(data_region)) - set(brreplay.REPLAY_TESTS):
     raise SystemExit(f"executor region traced for a test without replay: {tid}")
 for tid in brreplay.REPLAY_TESTS:
     if tid not in num or tid not in outer:
@@ -124,9 +127,21 @@ for tid in brreplay.REPLAY_TESTS:
     p = next_pseudo
     next_pseudo += 1
     replay[n] = p
-    per_test[p] = {f: set(v) for f, v in per_test[n].items()}
+    # what replay cannot run for real: the table data (class fixtures, the
+    # module's import, ensure_tables). The rest of the test runs for real
+    # during a replay, so changes there need no special care.
+    keep = {f: set() for f in per_test[n]}
+    cf = class_fixture.get(cls_of(tid))
+    cb = collect.get(tid.split("::", 1)[0])
+    for src in (cf, cb, data_region.get(tid)):
+        if src:
+            for f in keep:
+                keep[f] |= src.get(f, set())
+    per_test[p] = keep
     for f in per_test[n]:
         per_test[n][f] |= outer[tid].get(f, set())
+        if tid in data_region:
+            per_test[n][f] |= data_region[tid].get(f, set())
     if tid in execr:
         # a second pseudo test holds the executor region alone
         p2 = next_pseudo
@@ -148,6 +163,7 @@ key_tests = defaultdict(int)  # (attr key, key fp or "*") -> bits
 keyany_tests = defaultdict(int)  # attr key -> bits of tests with any recorded key use
 read_tests = defaultdict(int)  # owner attr key -> bits
 via_tests = defaultdict(int)  # via class -> bits
+attr_via_tests = defaultdict(int)  # (class read through, attribute name) -> bits
 open_tests = defaultdict(int)
 list_tests = defaultdict(int)
 for n, d in per_test.items():
@@ -158,6 +174,7 @@ for n, d in per_test.items():
         read_tests[k] |= bit
         if via:
             via_tests[via] |= bit
+            attr_via_tests[(via, k.rsplit(".", 1)[1])] |= bit
     for p in d["opens"]:
         open_tests[p] |= bit
     for p in d["lists"]:
@@ -366,6 +383,7 @@ maps = {
     "key_tests": intern(key_tests),
     "lazy_import_tests": dict(lazy_import_tests),
     "replay": replay,
+    "attr_via_tests": intern(attr_via_tests),
     "replay_exec": replay_exec,
     "name_global_tests": intern(name_global_tests),
     "name_attr_tests": intern(name_attr_tests),
