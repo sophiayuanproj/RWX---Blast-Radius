@@ -1,0 +1,1067 @@
+"""Blast Radius selector.
+
+For each patch:
+  1. Static analysis against the pinned sqlglot checkout: which code objects
+     changed (bytecode diff), which data files changed.
+  2. If module/class bodies (or functions run at import time) changed, import
+     the patched package and diff fingerprints of every module global and
+     class attribute against the pristine ones.
+  3. Map changes to candidate tests with per-test maps recorded at the pinned
+     commit (code objects run, class attributes read, files opened).
+  4. Run the cheap candidates here on the patched tree; include the ones that
+     fail, plus the expensive candidates that are cheaper to just hand to CI.
+"""
+
+import json
+import os
+import pickle
+import select
+import signal
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import brlib  # noqa: E402
+
+DATA = os.environ.get("BR_DATA", "/data")
+SRC = os.environ.get("BR_SRC", os.path.join(HERE, "src"))
+MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
+WORK = os.environ.get("BR_WORK", "/tmp/w")
+PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "4.4"))  # seconds of wall budget per commit
+LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
+LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
+WORKER_COST = 2000  # ms
+EVAL = os.environ.get("BR_EVAL")  # path to answers.json: print diagnostics to stderr
+
+PYTEST_CONFIG = {"conftest.py", "pytest.ini"}
+MAYBE_PYTEST_CONFIG = {"tox.ini", "setup.cfg", "pyproject.toml"}
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------- packing
+
+
+def pack(nums, ms):
+    """Best split over 1..8 workers (LPT). Returns (cost_ms, workers)."""
+    if not nums:
+        return 0, []
+    order = sorted(nums, key=lambda n: -ms[n])
+    best = None
+    total = sum(ms[n] for n in nums)
+    for k in range(1, min(8, len(order)) + 1):
+        if best is not None and max(ms[order[0]], total // k) + WORKER_COST * k >= best[0]:
+            if total // k <= ms[order[0]]:
+                break
+            continue
+        loads = [0] * k
+        ws = [[] for _ in range(k)]
+        for n in order:
+            i = loads.index(min(loads))
+            loads[i] += ms[n]
+            ws[i].append(n)
+        cost = max(loads) + WORKER_COST * k
+        if best is None or cost < best[0]:
+            best = (cost, ws)
+    return best
+
+
+# ------------------------------------------------------------------ overlay
+
+
+# files that locate siblings through Path.resolve(): give them a real path in
+# the overlay so they find patched neighbours
+COPY_REAL = ("tests/test_sqlglotc.py",)
+
+
+def build_overlay(root, files):
+    """Make root a view of SRC where `files` (rel path -> text or None for
+    deleted) replace the originals. Directories on the way are real; the rest
+    are symlinks."""
+    import shutil
+
+    files = dict(files)
+    real_copies = [c for c in COPY_REAL if c not in files]
+    dirs = set()
+    for rel in list(files) + real_copies:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]))
+    os.makedirs(root, exist_ok=True)
+
+    def fill(reldir):
+        src_dir = os.path.join(SRC, reldir) if reldir else SRC
+        dst_dir = os.path.join(root, reldir) if reldir else root
+        os.makedirs(dst_dir, exist_ok=True)
+        entries = os.listdir(src_dir) if os.path.isdir(src_dir) else []
+        for e in entries:
+            rel = f"{reldir}/{e}" if reldir else e
+            if rel in dirs or rel in files:
+                continue
+            if rel in real_copies:
+                shutil.copy2(os.path.join(src_dir, e), os.path.join(dst_dir, e))
+                continue
+            if e == "__pycache__" and reldir and any(f.startswith(reldir + "/") and f.count("/") == reldir.count("/") + 1 for f in files):
+                # keep stale pycs out of directories with replaced modules
+                continue
+            os.symlink(os.path.join(src_dir, e), os.path.join(dst_dir, e))
+        for d in sorted(dirs):
+            if (d.rsplit("/", 1)[0] if "/" in d else "") == reldir:
+                fill(d)
+
+    fill("")
+    for rel, text in files.items():
+        dst = os.path.join(root, rel)
+        if text is None:
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+
+# ----------------------------------------------------------------- analysis
+
+
+class Ctx:
+    def __init__(self, maps, tests):
+        self.maps = maps
+        self.tests = tests
+        self.n = len(tests)
+        self.ms = [round(t["seconds"] * 1000) for t in tests]
+        self.all_bits = (1 << self.n) - 1
+        # (file, qualname) -> bits, for functions whose first line moved
+        fq = {}
+        for (f, q, _l), b in maps["code_tests"].items():
+            fq[(f, q)] = fq.get((f, q), 0) | b
+        self.fq_tests = fq
+        mod_codes = {}
+        for (f, q, _l), b in maps["code_tests"].items():
+            mod_codes[f] = mod_codes.get(f, 0) | b
+        self.file_code_tests = mod_codes
+        self.import_codes = maps["import_codes"]
+        self.order_sensitive = maps.get("order_sensitive", set())
+        lc = maps.get("local_cpu") or [None] * self.n
+        self.local_ms = []
+        for i, t in enumerate(tests):
+            v = lc[i] if i < len(lc) else None
+            est = t["seconds"] * LOCAL_RATIO if v is None else v
+            if t["id"].endswith("::test_lazy_load"):
+                est = max(est, t["seconds"])  # runs a subprocess
+            self.local_ms.append(est * 1000)
+        self.class_setup_ms = {k: v * 1000 for k, v in (maps.get("class_setup") or {}).items()}
+        self.mod_import_ms = {k: v * 1000 for k, v in (maps.get("module_import_cpu") or {}).items()}
+        self.cls_of = []
+        self.mod_of = []
+        for t in tests:
+            f, _, rest = t["id"].partition("::")
+            mod = f[:-3].replace("/", ".")
+            self.mod_of.append(mod)
+            self.cls_of.append(mod + "." + rest.split("::")[0])
+        self.lazy_load = [i for i, t in enumerate(tests) if t["id"].endswith("test_dialect.py::TestDialect::test_lazy_load")]
+
+    def local_cost(self, nums):
+        """Estimated CPU ms to run nums here."""
+        if not nums:
+            return 0.0
+        total = LOCAL_FIXED * 1000
+        classes = set()
+        mods = set()
+        for n in nums:
+            total += self.local_ms[n]
+            classes.add(self.cls_of[n])
+            mods.add(self.mod_of[n])
+        for c in classes:
+            total += self.class_setup_ms.get(c, 0.0)
+        for m in mods:
+            total += self.mod_import_ms.get(m, 0.0)
+        return total
+
+
+def modname_of(rel):
+    if not rel.endswith(".py"):
+        return None
+    m = rel[:-3].replace("/", ".")
+    if m.endswith(".__init__"):
+        m = m[: -len(".__init__")]
+    return m
+
+
+def bits_list(bits):
+    out = []
+    i = 0
+    while bits:
+        if bits & 1:
+            out.append(i)
+        bits >>= 1
+        i += 1
+    return out
+
+
+def popcount(b):
+    return bin(b).count("1")
+
+
+class Analysis:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.cands = 0  # tests to decide on (run locally or include)
+        self.must = 0  # tests to include no matter what
+        self.need_fp = False
+        self.notes = []
+        self.files = {}  # rel -> new text or None
+        self.sqlglot_py_changed = False
+        self.fp_modules = set()  # sqlglot modules whose import-time state may differ
+        self.data_cands = 0  # candidates only because they read a changed data file
+        self.lazy_load = False
+        self.check_test_imports = False
+
+    def note(self, s):
+        self.notes.append(s)
+
+
+def analyse_static(ctx, patch_text):
+    maps = ctx.maps
+    a = Analysis(ctx)
+    fps = brlib.parse_patch(patch_text)
+    if not fps:
+        a.note("empty patch")
+        return a
+    for fp in fps:
+        for p in {fp.old_path, fp.new_path} - {None}:
+            a.cands |= maps["open_tests"].get(p, 0)
+            if not p.endswith(".py"):
+                a.data_cands |= maps["open_tests"].get(p, 0)
+            base = p.rsplit("/", 1)[-1]
+            if base in PYTEST_CONFIG or base.startswith("conftest"):
+                a.must |= ctx.all_bits
+                a.note(f"config file {p}")
+            elif base in MAYBE_PYTEST_CONFIG and "/" not in p:
+                touched = "\n".join(l for h in fp.hunks for l in h[4])
+                old_cfg = ""
+                try:
+                    with open(os.path.join(SRC, p), encoding="utf-8", errors="replace") as f:
+                        old_cfg = f.read()
+                except OSError:
+                    pass
+                if "pytest" in touched or "[tool:pytest]" in old_cfg or "[tool.pytest" in old_cfg or "[pytest]" in old_cfg:
+                    a.must |= ctx.all_bits
+                    a.note(f"pytest config in {p}")
+        if fp.is_new or fp.is_deleted or fp.rename:
+            for p in {fp.old_path, fp.new_path} - {None}:
+                d = p.rsplit("/", 1)[0] if "/" in p else ""
+                a.cands |= maps["list_tests"].get(d, 0)
+                a.cands |= maps["list_tests"].get(d.rstrip("/") or ".", 0)
+        if fp.binary:
+            a.note(f"binary {fp.path}")
+            if fp.path and fp.path.endswith(".py"):
+                a.must |= ctx.all_bits
+            continue
+
+        old_text = None
+        if fp.old_path is not None:
+            try:
+                with open(os.path.join(SRC, fp.old_path), encoding="utf-8", newline="") as f:
+                    old_text = f.read()
+            except (OSError, UnicodeDecodeError):
+                old_text = None
+        if fp.is_deleted:
+            new_text = None
+        else:
+            try:
+                new_text = brlib.apply_hunks(old_text or "", fp.hunks) if fp.hunks else (old_text or "")
+            except brlib.PatchError as e:
+                a.note(f"patch failed {fp.path}: {e}")
+                a.must |= ctx.all_bits
+                continue
+        if fp.rename and fp.old_path:
+            a.files[fp.old_path] = None
+        a.files[fp.path] = new_text
+
+        path = fp.path or fp.old_path
+        if not path.endswith(".py") and not (fp.old_path or "").endswith(".py"):
+            continue
+        in_pkg = path.startswith("sqlglot/") or (fp.old_path or "").startswith("sqlglot/")
+        in_tests = path.startswith("tests/") or (fp.old_path or "").startswith("tests/")
+        mod = modname_of(path)
+        if not in_pkg and not in_tests:
+            # scripts outside the package and the tests (setup.py, docs,
+            # benchmarks) are never imported by tests; readers were added above
+            continue
+        if fp.is_deleted or fp.rename or old_text is None:
+            # module removed / added
+            if fp.old_path:
+                om = modname_of(fp.old_path)
+                a.must |= maps["module_import_tests"].get(om, 0)
+                a.cands |= ctx.file_code_tests.get(fp.old_path, 0)
+                if fp.old_path.startswith("sqlglot/"):
+                    a.need_fp = True
+                    a.sqlglot_py_changed = True
+                    a.fp_modules = None  # module gone: look everywhere
+            if in_pkg:
+                a.need_fp = True
+                a.sqlglot_py_changed = True
+                a.fp_modules = None
+            if in_tests:
+                a.must |= maps["file_tests"].get(path, 0)
+            continue
+        try:
+            old_co = compile(old_text, path, "exec", dont_inherit=True)
+        except SyntaxError:
+            a.must |= ctx.all_bits
+            continue
+        try:
+            new_co = compile(new_text, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as e:
+            a.note(f"syntax error in {path}: {e}")
+            # importing this module fails. Which test files then fail to
+            # import is checked on the patched tree (fp_diff); tests that
+            # import it lazily ran its code.
+            a.cands |= ctx.file_code_tests.get(path, 0)
+            a.check_test_imports = True
+            if in_tests:
+                a.must |= maps["file_tests"].get(path, 0)
+            if in_pkg:
+                a.need_fp = True
+                a.sqlglot_py_changed = True
+                a.fp_modules = None
+            elif not in_tests:
+                a.must |= maps["module_import_tests"].get(mod, 0)
+            continue
+        changed, added, moved = brlib.code_diff(old_co, new_co)
+        hunk_lines = brlib.changed_old_lines(fp.hunks)
+        stmt_index = None
+        file_lines = maps.get("line_tests", {}).get(path)
+        if not changed and not added:
+            a.note(f"{path}: no bytecode change")
+            continue
+        if in_pkg:
+            a.sqlglot_py_changed = True
+        for co, kind in changed:
+            key = (path, co.co_qualname, co.co_firstlineno)
+            if brlib.is_function_code(co):
+                bits = ctx.maps["code_tests"].get(key, 0)
+                fine = None
+                if kind == "self" and file_lines is not None and bits and key not in ctx.order_sensitive:
+                    if stmt_index is None:
+                        try:
+                            stmt_index = brlib.StmtIndex(old_text)
+                        except SyntaxError:
+                            stmt_index = False
+                    if stmt_index:
+                        fine = narrow_by_lines(stmt_index, co, hunk_lines, file_lines)
+                if fine is not None:
+                    a.note(f"{path}:{co.co_qualname} {kind} -> {popcount(bits)} (lines: {popcount(fine & bits)})")
+                    bits &= fine
+                else:
+                    a.note(f"{path}:{co.co_qualname} {kind} -> {popcount(bits)}")
+                a.cands |= bits
+                if key in ctx.import_codes:
+                    a.need_fp = True
+                    _add_fp_module(a, mod, in_pkg)
+                    a.note(f"  runs at import time")
+                if not in_pkg and not in_tests:
+                    a.must |= ctx.all_bits
+            else:
+                a.note(f"{path}:{co.co_qualname} body changed")
+                if in_pkg:
+                    a.need_fp = True
+                    if co.co_qualname == "<module>":
+                        # module code can reach into other modules: diff everything
+                        a.fp_modules = None
+                    else:
+                        _add_fp_module(a, mod, in_pkg)
+                elif in_tests:
+                    # test module or test class body: every test in the
+                    # file, and in files importing it
+                    a.cands |= maps["file_tests"].get(path, 0)
+                    a.cands |= maps["module_import_tests"].get(mod, 0)
+                    if mod == "tests.helpers" or path.endswith("__init__.py"):
+                        a.cands |= maps["module_import_tests"].get(mod, 0)
+                else:
+                    a.must |= ctx.all_bits
+    return a
+
+
+def narrow_by_lines(si, co, hunk_lines, file_lines):
+    """Tests that ran a statement deciding whether the changed lines of `co`
+    are reached, or None when that cannot be told."""
+    span = brlib.code_line_span(co)
+    if not span:
+        return None
+    lo, hi = min(min(span), co.co_firstlineno), max(span)
+    # the function's own source extent (its last statement may end later)
+    for start, end, n, _p in si.nodes:
+        if getattr(n, "lineno", None) == co.co_firstlineno or start == co.co_firstlineno:
+            hi = max(hi, end)
+            break
+    mine = [l for l in hunk_lines if lo <= l <= hi]
+    if not mine:
+        return None
+    lines = set()
+    for l in mine:
+        d = si.deciding_lines(l, lo, hi)
+        if d is None:
+            return None
+        lines |= d
+    bits = 0
+    for l in lines:
+        bits |= file_lines.get(l, 0)
+    return bits
+
+
+def _add_fp_module(a, mod, in_pkg):
+    if a.fp_modules is not None and in_pkg:
+        a.fp_modules.add(mod)
+
+
+def fp_diff(ctx, a, pristine):
+    """Runs in the child, after sys.path points at the patched tree."""
+    import sys as _s
+
+    import brfp
+
+    maps = ctx.maps
+    t0 = time.process_time()
+    rdeps = maps.get("rdeps")
+    if rdeps is None or a.fp_modules is None:
+        errors = brfp.import_all()
+        scope = None
+    else:
+        import importlib
+
+        scope = set()
+        for m in a.fp_modules:
+            scope.add(m)
+            scope.update(rdeps.get(m, ()))
+        errors = {}
+        import sqlglot  # noqa: F401  (package side effects first)
+
+        scope.discard("sqlglot.__main__")
+        for m in sorted(scope):
+            try:
+                importlib.import_module(m)
+            except BaseException as e:  # noqa: BLE001
+                errors[m] = repr(e)
+        a.note(f"fp scope {len(scope)} modules")
+    if errors:
+        touch_by_mod = {}
+        for ck, b in maps["touch"].items():
+            m = ck.split(":", 1)[0]
+            touch_by_mod[m] = touch_by_mod.get(m, 0) | b
+    for mod, err in errors.items():
+        if len(a.notes) < 60:
+            a.note(f"import error {mod}: {err[:200]}")
+        rel = mod.replace(".", "/") + ".py"
+        # tests that ran its code import it one way or another
+        a.cands |= ctx.file_code_tests.get(rel, 0)
+        a.cands |= ctx.file_code_tests.get(mod.replace(".", "/") + "/__init__.py", 0)
+        a.cands |= touch_by_mod.get(mod, 0)
+        # function-level imports of it now raise
+        a.cands |= maps.get("lazy_import_tests", {}).get(mod, 0)
+    mods = brfp.sqlglot_modules() if scope is None else sorted(m for m in scope if m in _s.modules)
+    new = brfp.fingerprint_modules(mods)
+    unstable = pristine["unstable"]
+    still = pristine["still"]
+    if unstable:
+        newu = brfp.fingerprint_modules(mods, unordered=True, only=unstable)
+    old = pristine["fps"]
+    if scope is not None:
+        old = {k: v for k, v in old.items() if k.split("|", 2)[1] in scope}
+        # modules in scope that were never imported here (e.g. failed)
+    # globals present in the pristine full import but not here: lazily
+    # provided package attributes need a getattr to appear
+    fpx = None
+    for k in old:
+        if k in new or not k.startswith("G|"):
+            continue
+        _g, mod, name = k.split("|", 2)
+        if old[k][1].startswith("M:"):
+            continue
+        m = _s.modules.get(mod)
+        if m is None:
+            continue
+        try:
+            v = getattr(m, name)
+        except BaseException:  # noqa: BLE001
+            continue
+        if fpx is None:
+            fpx = brfp._FP()
+        new[k] = (brfp._tag(v), fpx.h(v))
+    diffs = []
+    for k in set(old) | set(new):
+        if k in still:
+            continue
+        if k in unstable:
+            if pristine["unordered"].get(k) != newu.get(k):
+                diffs.append(k)
+        elif old.get(k) != new.get(k):
+            diffs.append(k)
+    # modules that failed to import show up as missing keys; their tests are
+    # already in must
+    failed = set(errors)
+
+    for k in diffs:
+        kind, mod, rest = k.split("|", 2)
+        if mod in failed:
+            continue
+        o, n = old.get(k), new.get(k)
+        if kind == "G" and ((o and o[1].startswith("M:")) or (n and n[1].startswith("M:"))):
+            continue  # submodule binding: the submodule is diffed itself
+        if kind == "G" and o is None and "__getattr__" in vars(_s.modules.get(mod) or brfp):
+            continue  # cached by a lazy package __getattr__
+        tag = (n or o)[0]
+        if kind == "G":
+            name = rest
+            bits = global_readers(ctx, mod, name, o, n)
+            a.cands |= bits
+            a.note(f"global {mod}.{name} changed -> {popcount(bits)}")
+        elif kind == "A":
+            qual, attr = rest.rsplit("|", 1)
+            ck = f"{mod}:{qual}"
+            fam = [ck] + maps["descendants"].get(ck, [])
+            if o is None or n is None or o[0] != n[0]:
+                bits = 0
+                for c in fam:
+                    bits |= maps["touch"].get(c, 0)
+                bits |= maps["name_tests"].get(attr, 0) & bits_or_all(ctx, fam)
+                a.note(f"attr {ck}.{attr} added/removed/retyped -> {popcount(bits)}")
+            elif tag == "D":
+                rk = f"{mod}:{qual}.{attr}"
+                keyed_old = pristine.get("keyed", {}).get(k)
+                keyed_new = None
+                if keyed_old is not None and "key_tests" in maps and rk in maps.get("tracked", ()):
+                    cls = _resolve(mod, qual)
+                    v = cls.__dict__.get(attr) if cls is not None else None
+                    keyed_new = brfp.keyed_fp(v)
+                if keyed_old is not None and keyed_new is not None:
+                    changed_keys = [kk for kk in set(keyed_old) | set(keyed_new)
+                                    if keyed_old.get(kk) != keyed_new.get(kk)]
+                    kt = maps["key_tests"]
+                    bits = kt.get((rk, "*"), 0)
+                    for kk in changed_keys:
+                        bits |= kt.get((rk, kk), 0)
+                    a.note(f"attr {rk}: {len(changed_keys)} keys changed -> {popcount(bits)} "
+                           f"(of {popcount(maps['read_tests'].get(rk, 0))} readers)")
+                elif rk in maps["read_tests"] or rk in maps.get("tracked", ()):
+                    bits = maps["read_tests"].get(rk, 0)
+                else:
+                    bits = 0
+                    for c in fam:
+                        bits |= maps["touch"].get(c, 0)
+                    a.note("  (untracked attribute, using class touch)")
+                a.note(f"attr {rk} changed -> {popcount(bits)}")
+            elif tag == "F":
+                bits = 0
+                cls = _resolve(mod, qual)
+                v = cls.__dict__.get(attr) if cls is not None else None
+                for f, q in brfp.func_qualnames(v):
+                    rel = os.path.relpath(f, os.getcwd()) if os.path.isabs(f) else f
+                    bits |= ctx.fq_tests.get((rel, q), 0)
+                a.note(f"method {ck}.{attr} defaults/closure changed -> {popcount(bits)}")
+            else:  # attribute bound to a different class
+                rk = f"{mod}:{qual}.{attr}"
+                bits = maps["read_tests"].get(rk, 0)
+                for c in fam:
+                    bits |= maps["touch"].get(c, 0)
+                a.note(f"class-valued attr {rk} rebound -> {popcount(bits)}")
+            a.cands |= bits
+        elif kind == "B":
+            ck = f"{mod}:{rest}"
+            bits = 0
+            for c in [ck] + maps["descendants"].get(ck, []):
+                bits |= maps["touch"].get(c, 0)
+            a.cands |= bits
+            a.note(f"class {ck} bases/new -> {popcount(bits)}")
+    if errors or a.check_test_imports:
+        # test files that cannot be imported fail whole, as at collection
+        import importlib
+
+        bad = 0
+        if "sqlglot" in errors:
+            # the package itself is broken: every file importing it fails
+            a.must |= maps["module_import_tests"].get("sqlglot", ctx.all_bits)
+        for file in [] if "sqlglot" in errors else sorted({t["file"] for t in ctx.tests}):
+            modname = file[:-3].replace("/", ".")
+            try:
+                importlib.import_module(modname)
+            except BaseException as e:  # noqa: BLE001
+                bad += 1
+                a.must |= maps["file_tests"].get(file, 0)
+                a.note(f"test file {file} fails to import: {e!r}"[:200])
+        a.note(f"{bad} test files fail to import")
+    a.note(f"fp diff: {len(diffs)} keys, {time.process_time() - t0:.2f}s cpu")
+
+
+def global_readers(ctx, mod, name, o, n):
+    """Tests that can observe module global `name` of `mod` changing (o: old
+    fingerprint, n: new; None when absent)."""
+    import sys as _s
+
+    import brfp
+
+    maps = ctx.maps
+    ngt = maps.get("name_global_tests")
+    if ngt is None:  # older maps
+        return maps["name_tests"].get(name, 0)
+    base = mod.replace(".", "/")
+    files = (base + ".py", base + "/__init__.py")
+    bits = 0
+    for f in files:
+        bits |= ngt.get((f, name), 0)  # loads of the global inside its module
+    bits |= maps.get("lazy_import_tests", {}).get(f"{mod}.{name}", 0)  # from mod import name, in a function
+    functions_only = True
+    for side in (o, n):
+        if side is not None and side[0] != "F":
+            functions_only = False
+    if functions_only:
+        # a function: whoever reaches it from elsewhere calls it, so its callers
+        pristine_q = []
+        for f in files:
+            if ctx.fq_tests.get((f, name)):
+                pristine_q.append((f, name))
+        for key in pristine_q:
+            bits |= ctx.fq_tests[key]
+        v = getattr(_s.modules.get(mod), name, None) if n is not None else None
+        aliased = False
+        for f, q in brfp.func_qualnames(v):
+            rel = os.path.relpath(f, os.getcwd()) if os.path.isabs(f) else f
+            bits |= ctx.fq_tests.get((rel, q), 0)
+            if q != name:
+                aliased = True
+        if aliased or (o is not None and not pristine_q):
+            bits |= maps["name_attr_tests"].get(name, 0)
+    else:
+        bits |= maps["name_attr_tests"].get(name, 0)
+    return bits
+
+
+def bits_or_all(ctx, fam):
+    return ctx.all_bits
+
+
+def _resolve(mod, qual):
+    import sys as _s
+
+    obj = _s.modules.get(mod)
+    for part in qual.split("."):
+        obj = getattr(obj, part, None) if obj is not None else None
+        if obj is None:
+            return None
+        if hasattr(obj, "__get__") and not isinstance(obj, type):
+            return None
+    return obj
+
+
+# ------------------------------------------------------------- local tests
+
+
+class _Timeout(BaseException):
+    pass
+
+
+def run_local(ctx, nums, deadline, blind=()):
+    """Run tests (in tests.json order) in this process. Returns (failed set,
+    not_run set)."""
+    import unittest
+
+    import brpool
+
+    brpool.install()
+    tests = ctx.tests
+    failed = set()
+    completed = set()
+    why = []
+    # cheapest classes first, cheapest tests first inside a class
+    by_cls = {}
+    for n in nums:
+        by_cls.setdefault(ctx.cls_of[n], []).append(n)
+    cls_order = sorted(by_cls, key=lambda c: min(ctx.local_ms[n] for n in by_cls[c]) + ctx.class_setup_ms.get(c, 0))
+    by_mod = {}
+    run_order = []
+    for c in cls_order:
+        for n in sorted(by_cls[c], key=lambda n: ctx.local_ms[n]):
+            tid = tests[n]["id"]
+            file, _, rest = tid.partition("::")
+            by_mod.setdefault(file, []).append((n, rest))
+            run_order.append(n)
+    blind = list(blind)
+
+    id_to_num = {}
+    loaded = {}
+    for file, items in by_mod.items():
+        modname = file[:-3].replace("/", ".")
+        try:
+            module = __import__(modname, fromlist=["*"])
+        except BaseException as e:  # noqa: BLE001
+            log(f"  import of {file} failed: {e!r}"[:300])
+            # the whole file fails in CI
+            failed |= set(bits_list(ctx.maps["file_tests"].get(file, 0)))
+            continue
+        for n, rest in items:
+            parts = rest.split("::")
+            try:
+                obj = module
+                for p in parts[:-1]:
+                    obj = getattr(obj, p)
+                test = obj(parts[-1])
+            except BaseException as e:  # noqa: BLE001
+                log(f"  load {tests[n]['id']} failed: {e!r}"[:300])
+                failed.add(n)
+                continue
+            id_to_num[test.id()] = n
+            loaded[n] = test
+    suite = unittest.TestSuite([loaded[n] for n in run_order if n in loaded])
+    started = set()
+
+    class Result(unittest.TestResult):
+        def __init__(self):
+            super().__init__()
+            self.cur = None
+
+        def _mark(self, test):
+            n = id_to_num.get(test.id()) if hasattr(test, "id") else None
+            if n is None:
+                # class / module fixture failure: description like
+                # "setUpClass (tests.x.TestY)"
+                desc = str(test)
+                hit = False
+                for tid, m in id_to_num.items():
+                    clsname = tid.rsplit(".", 1)[0]
+                    if clsname in desc or clsname.rsplit(".", 1)[0] in desc:
+                        failed.add(m)
+                        hit = True
+                if not hit:
+                    failed.update(id_to_num.values())
+            else:
+                failed.add(n)
+
+        def startTest(self, test):
+            super().startTest(test)
+            n = id_to_num.get(test.id())
+            if n is not None:
+                started.add(n)
+            self.cur = n
+            self.t0 = time.process_time()
+            if n is not None:
+                # CPU-time limit: wall time depends on what else the machine runs;
+                # a test stuck without burning CPU is caught by the parent's deadline
+                limit = max(2.0, 4 * max(tests[n]["seconds"], ctx.local_ms[n] / 1000) + 1.5)
+                signal.setitimer(signal.ITIMER_PROF, limit)
+
+        def stopTest(self, test):
+            signal.setitimer(signal.ITIMER_PROF, 0)
+            n = id_to_num.get(test.id())
+            if n is not None:
+                completed.add(n)
+            super().stopTest(test)
+            if n in failed and not self.shouldStop:
+                # a worker is needed anyway now: maybe the rest is cheaper in CI
+                rest = [m for m in loaded if m not in started]
+                if rest:
+                    base = blind + sorted(failed)
+                    inc = pack(base + rest, ctx.ms)[0] - pack(base, ctx.ms)[0]
+                    if inc < ctx.local_cost(rest) - LOCAL_FIXED * 1000:
+                        log(f"  stopping after failure: {len(rest)} left go to CI")
+                        self.shouldStop = True
+
+        def _why(self, test, err):
+            if len(why) < 6:
+                try:
+                    why.append(f"{test.id()}: {err[0].__name__}: {str(err[1])[:120]}")
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def addError(self, test, err):
+            self._why(test, err)
+            self._mark(test)
+
+        def addFailure(self, test, err):
+            self._why(test, err)
+            self._mark(test)
+
+        def addSubTest(self, test, subtest, err):
+            if err is not None:
+                self._why(test, err)
+                self._mark(test)
+
+        def addUnexpectedSuccess(self, test):
+            self._mark(test)
+
+    def on_alarm(signum, frame):
+        raise _Timeout()
+
+    signal.signal(signal.SIGPROF, on_alarm)
+    result = Result()
+    try:
+        suite.run(result)
+    except _Timeout:
+        pass
+    signal.setitimer(signal.ITIMER_PROF, 0)
+    # whatever did not run to the end counts as failing
+    failed |= set(id_to_num.values()) - completed
+    for w in why:
+        log("  local failure: " + w)
+    return failed
+
+
+# -------------------------------------------------------------- per commit
+
+
+P_DATA = float(os.environ.get("BR_P_DATA", "0.85"))
+
+
+def expected_local(ctx, a, blind, local):
+    """Expected cost (ms) of running `local` here with `blind` handed to CI."""
+    ms = ctx.ms
+    cost = ctx.local_cost(local)
+    lb = 0
+    for n in local:
+        lb |= 1 << n
+    p = P_DATA if (lb & a.data_cands) else P_FAIL
+    lms = sum(ms[n] for n in local)
+    if blind:
+        cost += pack(blind, ms)[0] + p * 0.3 * lms
+    else:
+        cost += p * (WORKER_COST + 0.5 * lms)
+    return cost
+
+
+def decide(ctx, a, max_local_ms=float("inf")):
+    """Split candidates into (blind, local)."""
+    ms = ctx.ms
+    must = bits_list(a.must)
+    cands = [n for n in bits_list(a.cands & ~a.must)]
+    if not cands:
+        return must, []
+    order = sorted(cands, key=lambda n: -ctx.local_ms[n])
+    blind_base = list(must)
+    best = (pack(blind_base + order, ms)[0], len(order))  # everything blind
+    for j in range(0, min(len(order), 80)):
+        blind = blind_base + order[:j]
+        if ctx.local_cost(order[j:]) > max_local_ms:
+            continue
+        cost = expected_local(ctx, a, blind, order[j:])
+        if cost < best[0]:
+            best = (cost, j)
+    j = best[1]
+    return blind_base + order[:j], order[j:]
+
+
+def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
+    def send(obj):
+        data = (json.dumps(obj) + "\n").encode()
+        os.write(out_fd, data)
+
+    a = analyse_static(ctx, patch_text)
+    root = os.path.join(WORK, cid)
+    try:
+        build_overlay(root, a.files)
+    except Exception as e:  # noqa: BLE001
+        a.note(f"overlay failed {e!r}")
+        a.must |= ctx.all_bits
+    os.chdir(root)
+    sys.path.insert(0, root)
+    sys.dont_write_bytecode = True
+    if a.need_fp:
+        base = ctx.maps.get("base_import")
+        if base is None or a.fp_modules is None or (a.fp_modules & base):
+            for n in ctx.lazy_load:
+                a.cands |= 1 << n
+        try:
+            fp_diff(ctx, a, pristine)
+        except Exception as e:  # noqa: BLE001
+            a.note(f"fp diff failed: {e!r}")
+            a.cands |= ctx.all_bits
+    # local work must fit well inside this commit's share of the time limit
+    blind, local = decide(ctx, a, max_local_ms=max(0.0, (deadline - time.monotonic()) * 1000 * 0.6))
+    if local:
+        a.note(f"local estimate {ctx.local_cost(local)/1000:.2f}s cpu; tests: " + ", ".join(
+            ctx.tests[n]["id"].split("::", 1)[1] for n in sorted(local, key=lambda n: -ctx.local_ms[n])[:4]))
+    send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes})
+    failed = set()
+    if local:
+        failed = run_local(ctx, set(local), deadline, blind)
+    send({"stage": "done", "failed": sorted(failed)})
+
+
+def child_main(ctx, cid, patch_text, pristine, w, deadline):
+    # keep stdout clean: tests print
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    sys.stdout = sys.stderr
+    try:
+        process_commit(ctx, cid, patch_text, pristine, w, deadline)
+    except BaseException as e:  # noqa: BLE001
+        try:
+            os.write(w, (json.dumps({"stage": "error", "error": repr(e)}) + "\n").encode())
+        except Exception:
+            pass
+    os._exit(0)
+
+
+def main():
+    t_start = time.monotonic()
+    tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+    with open(os.path.join(MAPS, "maps.pkl"), "rb") as f:
+        maps = pickle.load(f)
+    with open(os.path.join(MAPS, "fp.pkl"), "rb") as f:
+        pristine = pickle.load(f)
+    if maps["test_ids"] != [t["id"] for t in tests]:
+        log("WARNING: tests.json differs from the map; remapping by id")
+        maps = remap(maps, tests)
+    ctx = Ctx(maps, tests)
+    preimport(maps)
+    cdir = os.path.join(DATA, "commits")
+    commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
+    n = len(commits)
+    global_deadline = t_start + PER_COMMIT_WALL * n / max(1, PARALLEL) * PARALLEL / 2 + 5
+    global_deadline = t_start + max(20.0, PER_COMMIT_WALL * n)
+    os.makedirs(WORK, exist_ok=True)
+
+    results = {}
+    pending = list(commits)
+    running = {}  # pid -> state
+    answers = None
+    if EVAL:
+        answers = json.load(open(EVAL))["commits"]
+
+    def finish(st, killed=False):
+        plan = st.get("plan")
+        if plan is None:
+            sel = list(range(ctx.n))
+            why = "no plan"
+        elif "done" in st:
+            sel = sorted(set(plan["blind"]) | set(st["done"]["failed"]))
+            why = "ok"
+        else:
+            sel = sorted(set(plan["blind"]) | set(plan["local"]))
+            why = "local run incomplete"
+        cost, workers = pack(sel, ctx.ms)
+        results[st["cid"]] = workers
+        msg = f"{st['cid']}: cpu={st.get('cpu', -1):.2f} {why} blind={len(plan['blind']) if plan else '-'} local={len(plan['local']) if plan else '-'} sel={len(sel)} cost={cost/1000:.2f}s"
+        if answers is not None:
+            fail = set(answers[st["cid"]]["failing"])
+            miss = fail - set(sel)
+            msg += f" failing={len(fail)} MISS={len(miss)}" if miss else f" failing={len(fail)}"
+            if plan:
+                for nt in plan["notes"][:int(os.environ.get("BR_NOTES", "12"))]:
+                    msg += "\n     " + nt
+            if miss:
+                msg += "\n     missed: " + ", ".join(tests[m]["id"] for m in sorted(miss)[:5])
+        log(msg)
+
+    while pending or running:
+        while pending and len(running) < PARALLEL:
+            cid = pending.pop(0)
+            with open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape") as f:
+                text = f.read()
+            remaining = global_deadline - time.monotonic()
+            share = remaining * PARALLEL / max(1, len(pending) + len(running) + 1)
+            per = max(1.0, min(share, remaining))
+            deadline = time.monotonic() + per
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                child_main(ctx, cid, text, pristine, w, deadline - 0.3)
+            os.close(w)
+            running[pid] = {"cid": cid, "fd": r, "buf": b"", "deadline": deadline + 0.5, "t0": time.monotonic()}
+        fds = {st["fd"]: pid for pid, st in running.items()}
+        timeout = max(0.0, min(st["deadline"] for st in running.values()) - time.monotonic())
+        rl, _, _ = select.select(list(fds), [], [], timeout)
+        for fd in rl:
+            pid = fds[fd]
+            st = running[pid]
+            chunk = os.read(fd, 1 << 20)
+            if chunk:
+                st["buf"] += chunk
+                while b"\n" in st["buf"]:
+                    line, st["buf"] = st["buf"].split(b"\n", 1)
+                    msg = json.loads(line)
+                    if msg["stage"] == "plan":
+                        st["plan"] = msg
+                    elif msg["stage"] == "done":
+                        st["done"] = msg
+                    elif msg["stage"] == "error":
+                        log(f"{st['cid']}: child error {msg['error']}")
+                continue
+            # EOF
+            os.close(fd)
+            _, _, ru = os.wait4(pid, 0)
+            st["cpu"] = ru.ru_utime + ru.ru_stime
+            del running[pid]
+            finish(st)
+            cleanup(st["cid"])
+        now = time.monotonic()
+        for pid, st in list(running.items()):
+            if now > st["deadline"]:
+                log(f"{st['cid']}: over time, killing")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(pid, 0)
+                os.close(st["fd"])
+                del running[pid]
+                finish(st, killed=True)
+                cleanup(st["cid"])
+
+    for cid in commits:
+        print(json.dumps({"commit": cid, "workers": results.get(cid, [])}))
+    sys.stdout.flush()
+    log(f"total wall {time.monotonic() - t_start:.1f}s")
+
+
+def preimport(maps):
+    """Import what test files import (but not sqlglot) once, before forking,
+    so children share it instead of paying for it every commit."""
+    import brfp
+
+    brfp.preimport(maps.get("thirdparty", ()))
+    bad = [m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")]
+    for m in bad:  # never let the pristine package leak into children
+        del sys.modules[m]
+
+
+def cleanup(cid):
+    import shutil
+
+    shutil.rmtree(os.path.join(WORK, cid), ignore_errors=True)
+
+
+def remap(maps, tests):
+    old_ids = maps["test_ids"]
+    new_num = {t["id"]: t["number"] for t in tests}
+    trans = {i: new_num[tid] for i, tid in enumerate(old_ids) if tid in new_num}
+    unknown_new = [t["number"] for t in tests if t["id"] not in set(old_ids)]
+    unk_bits = 0
+    for u in unknown_new:
+        unk_bits |= 1 << u
+
+    def conv(b):
+        out = 0
+        for i in bits_list(b):
+            if i in trans:
+                out |= 1 << trans[i]
+        # tests we know nothing about: always candidates
+        return out | unk_bits if b else out
+
+    for key in ("code_tests", "read_tests", "touch", "name_tests", "open_tests", "list_tests",
+                "file_tests", "module_import_tests"):
+        maps[key] = {k: conv(v) for k, v in maps[key].items()}
+    file_tests = {}
+    for t in tests:
+        file_tests[t["file"]] = file_tests.get(t["file"], 0) | (1 << t["number"])
+    maps["file_tests"] = file_tests
+    maps["test_ids"] = [t["id"] for t in tests]
+    return maps
+
+
+if __name__ == "__main__":
+    main()
