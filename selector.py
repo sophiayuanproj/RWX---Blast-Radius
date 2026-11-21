@@ -31,7 +31,7 @@ MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
 WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
-REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
+REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0.5"))  # share of a test's CI seconds worth spending to verify it
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
