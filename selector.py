@@ -32,6 +32,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
+LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
@@ -1023,6 +1024,71 @@ def expected_local(ctx, a, blind, local):
     return cost
 
 
+# The executor tests read their query files through load_sql_fixture_pairs:
+# test_execute_* use only each pair's input SQL (and its #meta), and
+# test_optimized_tpch also uses the expected SQL. An edit that leaves the
+# fields a test reads unchanged cannot change that test.
+_FIXTURE_READERS = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": (("TestExecutor::test_execute_tpcds", False),),
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": (("TestExecutor::test_execute_tpch", False),
+                                                 ("TestExecutor::test_optimized_tpch", True)),
+}
+
+
+def _fixture_pairs(text):
+    stmts = "\n".join(l for l in text.splitlines() if l and not l.startswith("--")).split(";")
+    out = []
+    for i in range(0, len(stmts), 2):
+        if i + 1 < len(stmts):
+            sql = stmts[i].strip()
+            lines = sql.split("\n")
+            j, meta = 0, []
+            while j < len(lines) and lines[j].startswith("#"):
+                if ":" not in lines[j]:
+                    return None
+                k, v = lines[j].split(":", 1)
+                meta.append((k.lstrip("#").strip(), v.strip()))
+                j += 1
+            out.append((tuple(meta), "\n".join(lines[j:]), stmts[i + 1].strip()))
+    return out
+
+
+def fixture_field_prune(ctx, a, root):
+    """Drop executor tests whose fixture fields an edit leaves untouched.
+    Only when the commit edits nothing but these query files."""
+    files = set(a.files)
+    if not files or not files <= set(_FIXTURE_READERS):
+        return
+    affected = set()
+    for path in files:
+        try:
+            with open(os.path.join(SRC, path), encoding="utf-8") as f:
+                old = _fixture_pairs(f.read())
+            with open(os.path.join(root, path), encoding="utf-8") as f:
+                new = _fixture_pairs(f.read())
+        except Exception:  # noqa: BLE001
+            return
+        if old is None or new is None:
+            return
+        for suffix, reads_expected in _FIXTURE_READERS[path]:
+            if len(old) != len(new):
+                affected.add(suffix)
+            elif reads_expected:
+                if old != new:
+                    affected.add(suffix)
+            elif [(m, q) for m, q, _ in old] != [(m, q) for m, q, _ in new]:
+                affected.add(suffix)
+    readers = {sfx for rs in _FIXTURE_READERS.values() for sfx, _ in rs}
+    for n, t in enumerate(ctx.tests):
+        sfx = next((r for r in readers if t["id"].endswith(r)), None)
+        if sfx is None or sfx in affected or (a.must >> n) & 1:
+            continue
+        if ((a.cands | a.cands_fn) >> n) & 1:
+            a.cands &= ~(1 << n)
+            a.cands_fn &= ~(1 << n)
+            a.note(f"query-file fields read by {sfx.rsplit('::', 1)[1]} unchanged: dropped")
+
+
 def resolve_replay(ctx, a):
     """Fold the pseudo tests (everything but the front end; the executor alone)
     back into their tests, and pick the replayable tests a replay can verify:
@@ -1060,6 +1126,8 @@ def resolve_replay(ctx, a):
         extra = sum(data.get("exec_cpu", {}).get(k, 0.0) for k in real)
         # its query file edited: the few queries with new SQL run for real
         edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
+        if edited and not LINKED_REPLAY:
+            continue  # an edited query file: hand the test to CI (no local attempt)
         if edited:
             nh = sum(len(a.hunks_by_file.get(f, [])) for f in edited) or 1
             real = set(real) | {("__unknown__", nh)}
@@ -1128,6 +1196,10 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         except Exception as e:  # noqa: BLE001
             a.note(f"fp diff failed: {e!r}")
             a.cands |= ctx.all_bits
+    try:
+        fixture_field_prune(ctx, a, root)
+    except Exception as e:  # noqa: BLE001
+        a.note(f"fixture prune failed {e!r}")
     a.replay_mode = resolve_replay(ctx, a)
     # local work must fit well inside this commit's share of the time limit
     blind, local = decide(ctx, a, max_local_ms=max(0.0, (deadline - time.monotonic()) * 1000 * 0.6))
