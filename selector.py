@@ -31,11 +31,12 @@ MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
 WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
-REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0.5"))  # share of a test's CI seconds worth spending to verify it
+REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
-ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "1") == "1"  # verify every candidate here (measurement)
+SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
+ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "0") == "1"  # verify every candidate here (measurement)
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
 WORKER_COST = 2000  # ms
@@ -1173,7 +1174,8 @@ def decide(ctx, a, max_local_ms=float("inf")):
         # verify the first few, or all but the last few (the cheap-to-verify
         # costly tests sit at the end of the second order)
         L = len(order)
-        for j in sorted(set(range(0, min(L, 80))) | set(range(max(0, L - 80), L))):
+        js = range(0, min(L, 80)) if not SUFFIX_PLANS else sorted(set(range(0, min(L, 80))) | set(range(max(0, L - 80), L)))
+        for j in js:
             blind = blind_base + order[:j]
             if ctx.local_cost(order[j:]) > max_local_ms:
                 continue
