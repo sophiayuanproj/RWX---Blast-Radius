@@ -1352,8 +1352,13 @@ def main():
                 finish(st, killed=True)
                 cleanup(st["cid"])
 
+    # DIAGNOSTIC BUILD: leave out every test recorded at 2 s or more, to
+    # measure on the board how often those tests really fail (300 s misses)
+    # and how much they cost when sent.
+    big = {t["number"] for t in tests if t["seconds"] >= 2.0}
     for cid in commits:
-        print(json.dumps({"commit": cid, "workers": results.get(cid, [])}))
+        ws = [[n for n in w if n not in big] for w in results.get(cid, [])]
+        print(json.dumps({"commit": cid, "workers": [w for w in ws if w]}))
     sys.stdout.flush()
     log(f"total wall {time.monotonic() - t_start:.1f}s")
 
