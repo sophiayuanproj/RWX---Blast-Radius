@@ -62,6 +62,7 @@ for b in buckets.values():
 per_test = defaultdict(lambda: {f: set() for f in FIELDS})
 class_fixture = defaultdict(lambda: {f: set() for f in FIELDS})
 collect = {}
+outer = {}  # front-end coverage of replayable tests (see brreplay)
 unknown = set()
 for key, b in buckets.items():
     phase, _, rest = key.partition(":")
@@ -78,6 +79,8 @@ for key, b in buckets.items():
                 cf[f] |= b[f]
     elif phase == "collect":
         collect[rest] = b
+    elif phase == "outer":
+        outer[rest] = b
 if unknown:
     print("tests not in tests.json:", sorted(unknown), file=sys.stderr)
 
@@ -94,6 +97,26 @@ for t in tests:
             d[f] |= cb[f]
     else:
         print("no collect bucket for", t["file"], file=sys.stderr)
+
+# replayable tests: their own number gets everything, a pseudo number (after
+# the real ones) gets everything except the front end
+replay = {}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import brreplay  # noqa: E402
+
+next_pseudo = len(tests)
+for tid in brreplay.REPLAY_TESTS:
+    if tid not in num or tid not in outer:
+        print("no outer coverage for", tid, file=sys.stderr)
+        continue
+    n = num[tid]
+    p = next_pseudo
+    next_pseudo += 1
+    replay[n] = p
+    per_test[p] = {f: set(v) for f, v in per_test[n].items()}
+    for f in per_test[n]:
+        per_test[n][f] |= outer[tid].get(f, set())
+    print(f"replay {tid}: inner codes {len(per_test[p]['codes'])}, all {len(per_test[n]['codes'])}", file=sys.stderr)
 
 missing = [t["id"] for t in tests if not per_test[t["number"]]["codes"]]
 if missing:
@@ -322,6 +345,7 @@ maps = {
     "order_sensitive": order_sensitive,
     "key_tests": intern(key_tests),
     "lazy_import_tests": dict(lazy_import_tests),
+    "replay": replay,
     "name_global_tests": intern(name_global_tests),
     "name_attr_tests": intern(name_attr_tests),
     "keyany_tests": intern(keyany_tests),

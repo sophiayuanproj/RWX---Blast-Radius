@@ -30,7 +30,9 @@ SRC = os.environ.get("BR_SRC", os.path.join(HERE, "src"))
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
 WORK = os.environ.get("BR_WORK", "/tmp/w")
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
-PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "4.4"))  # seconds of wall budget per commit
+PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
+REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
+RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
@@ -128,8 +130,37 @@ def build_overlay(root, files):
 # ----------------------------------------------------------------- analysis
 
 
+REF_BENCH = float(os.environ.get("BR_REF_BENCH", "0.0112"))  # bench() cpu on the machine the estimates come from
+
+
+def bench():
+    t0 = time.process_time()
+    d = {}
+    acc = 0
+    for i in range(60000):
+        k = "k" + str(i % 997)
+        d[k] = d.get(k, 0) + i
+        acc += len(k) * (i & 7)
+    sorted(d.items())
+    return time.process_time() - t0
+
+
+def calibrate():
+    """How much slower this machine runs Python than the one the local cost
+    estimates were measured on."""
+    if os.environ.get("BR_SPEED"):
+        return float(os.environ["BR_SPEED"])
+    runs = sorted(bench() for _ in range(5))
+    t = runs[1]  # second fastest: steady against a stray slow run
+    f = t / REF_BENCH
+    if 0.85 <= f <= 1.2:
+        f = 1.0  # same class of machine as the estimates: do not chase noise
+    return max(0.5, min(4.0, f))
+
+
 class Ctx:
-    def __init__(self, maps, tests):
+    def __init__(self, maps, tests, speed=1.0):
+        self.speed = speed
         self.maps = maps
         self.tests = tests
         self.n = len(tests)
@@ -153,9 +184,9 @@ class Ctx:
             est = t["seconds"] * LOCAL_RATIO if v is None else v
             if t["id"].endswith("::test_lazy_load"):
                 est = max(est, t["seconds"])  # runs a subprocess
-            self.local_ms.append(est * 1000)
-        self.class_setup_ms = {k: v * 1000 for k, v in (maps.get("class_setup") or {}).items()}
-        self.mod_import_ms = {k: v * 1000 for k, v in (maps.get("module_import_cpu") or {}).items()}
+            self.local_ms.append(est * 1000 * speed)
+        self.class_setup_ms = {k: v * 1000 * speed for k, v in (maps.get("class_setup") or {}).items()}
+        self.mod_import_ms = {k: v * 1000 * speed for k, v in (maps.get("module_import_cpu") or {}).items()}
         self.cls_of = []
         self.mod_of = []
         for t in tests:
@@ -169,7 +200,7 @@ class Ctx:
         """Estimated CPU ms to run nums here."""
         if not nums:
             return 0.0
-        total = LOCAL_FIXED * 1000
+        total = LOCAL_FIXED * 1000 * self.speed
         classes = set()
         mods = set()
         for n in nums:
@@ -665,7 +696,7 @@ class _Timeout(BaseException):
     pass
 
 
-def run_local(ctx, nums, deadline, blind=()):
+def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
     """Run tests (in tests.json order) in this process. Returns (failed set,
     not_run set)."""
     import unittest
@@ -676,6 +707,11 @@ def run_local(ctx, nums, deadline, blind=()):
     tests = ctx.tests
     failed = set()
     completed = set()
+    hooks = None
+    if replay:
+        import brreplay
+
+        hooks = brreplay.Hooks(ctx.maps["_replay_data"], "replay")
     why = []
     # cheapest classes first, cheapest tests first inside a class
     by_cls = {}
@@ -716,6 +752,12 @@ def run_local(ctx, nums, deadline, blind=()):
                 continue
             id_to_num[test.id()] = n
             loaded[n] = test
+    restore_setup = None
+    if hooks is not None and REPLAY_BUDGET == 0:
+        classes = {type(loaded[n]) for n in replay if n in loaded}
+        for cls in classes:
+            if all(n in replay for n in loaded if type(loaded[n]) is cls):
+                restore_setup = brreplay.light_setup(cls)
     suite = unittest.TestSuite([loaded[n] for n in run_order if n in loaded])
     started = set()
 
@@ -746,6 +788,17 @@ def run_local(ctx, nums, deadline, blind=()):
             n = id_to_num.get(test.id())
             if n is not None:
                 started.add(n)
+            if hooks is not None and n in replay:
+                try:
+                    hooks.budget = REPLAY_BUDGET * tests[n]["seconds"] / ctx.speed
+                    hooks.install(test)
+                except BaseException as e:  # noqa: BLE001
+                    log(f"  replay hooks failed: {e!r}")
+                    failed.add(n)
+                    hooks.uninstall()
+                    # do not pay for a full run: skip the test, it is handed to CI
+                    test._outcome = None
+                    setattr(test, test._testMethodName, lambda: None)
             self.cur = n
             self.t0 = time.process_time()
             if n is not None:
@@ -757,6 +810,8 @@ def run_local(ctx, nums, deadline, blind=()):
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_PROF, 0)
             n = id_to_num.get(test.id())
+            if hooks is not None and hooks.active:
+                hooks.uninstall()
             if n is not None:
                 completed.add(n)
             super().stopTest(test)
@@ -766,7 +821,7 @@ def run_local(ctx, nums, deadline, blind=()):
                 if rest:
                     base = blind + sorted(failed)
                     inc = pack(base + rest, ctx.ms)[0] - pack(base, ctx.ms)[0]
-                    if inc < ctx.local_cost(rest) - LOCAL_FIXED * 1000:
+                    if inc < ctx.local_cost(rest) - LOCAL_FIXED * 1000 * ctx.speed:
                         log(f"  stopping after failure: {len(rest)} left go to CI")
                         self.shouldStop = True
 
@@ -798,11 +853,16 @@ def run_local(ctx, nums, deadline, blind=()):
 
     signal.signal(signal.SIGPROF, on_alarm)
     result = Result()
+    # the first failing subtest decides the test: stop it there (our add*
+    # methods never call stop(), so the suite itself carries on)
+    result.failfast = True
     try:
         suite.run(result)
     except _Timeout:
         pass
     signal.setitimer(signal.ITIMER_PROF, 0)
+    if restore_setup is not None:
+        restore_setup()
     # whatever did not run to the end counts as failing
     failed |= set(id_to_num.values()) - completed
     for w in why:
@@ -832,6 +892,38 @@ def expected_local(ctx, a, blind, local):
     return cost
 
 
+def resolve_replay(ctx, a):
+    """Fold the pseudo tests (front end excluded) back into their tests and
+    pick the tests whose change can only reach their front end."""
+    mode = set()
+    rmap = ctx.maps.get("replay") or {}
+    data = ctx.maps.get("_replay_data")
+    import brreplay
+
+    test_file_changed = brreplay.TEST_FILE in a.files
+    for t, p in rmap.items():
+        inner = ((a.cands | a.must) >> p) & 1
+        a.cands &= ~(1 << p)
+        a.must &= ~(1 << p)
+        a.data_cands &= ~(1 << p)
+        if not ((a.cands >> t) & 1) or ((a.must >> t) & 1) or inner or test_file_changed or not data:
+            continue
+        tid = ctx.tests[t]["id"]
+        cpu = (data.get("cpu") or {}).get(tid)
+        if cpu is None:
+            continue
+        mode.add(t)
+        ctx.local_ms[t] = cpu * 1000 * ctx.speed
+        if REPLAY_BUDGET == 0 and data.get("light_setup_cpu") is not None:
+            ctx.class_setup_ms[ctx.cls_of[t]] = data["light_setup_cpu"] * 1000 * ctx.speed
+        a.note(f"replay {tid.rsplit('::', 1)[1]}: front end only, {cpu:.2f}s cpu to verify")
+    # never let a pseudo number through
+    lim = (1 << ctx.n) - 1
+    a.cands &= lim
+    a.must &= lim
+    return mode
+
+
 def decide(ctx, a, max_local_ms=float("inf")):
     """Split candidates into (blind, local)."""
     ms = ctx.ms
@@ -839,18 +931,21 @@ def decide(ctx, a, max_local_ms=float("inf")):
     cands = [n for n in bits_list(a.cands & ~a.must)]
     if not cands:
         return must, []
-    order = sorted(cands, key=lambda n: -ctx.local_ms[n])
     blind_base = list(must)
-    best = (pack(blind_base + order, ms)[0], len(order))  # everything blind
-    for j in range(0, min(len(order), 80)):
-        blind = blind_base + order[:j]
-        if ctx.local_cost(order[j:]) > max_local_ms:
-            continue
-        cost = expected_local(ctx, a, blind, order[j:])
-        if cost < best[0]:
-            best = (cost, j)
-    j = best[1]
-    return blind_base + order[:j], order[j:]
+    best = (pack(blind_base + cands, ms)[0], cands, [])  # everything blind
+    orders = (
+        sorted(cands, key=lambda n: -ctx.local_ms[n]),  # costly to verify first
+        sorted(cands, key=lambda n: -(ctx.local_ms[n] + 1) / (ms[n] + 1)),  # costly relative to CI first
+    )
+    for order in orders:
+        for j in range(0, min(len(order), 80)):
+            blind = blind_base + order[:j]
+            if ctx.local_cost(order[j:]) > max_local_ms:
+                continue
+            cost = expected_local(ctx, a, blind, order[j:])
+            if cost < best[0]:
+                best = (cost, order[:j], order[j:])
+    return blind_base + list(best[1]), list(best[2])
 
 
 def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
@@ -878,6 +973,7 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         except Exception as e:  # noqa: BLE001
             a.note(f"fp diff failed: {e!r}")
             a.cands |= ctx.all_bits
+    a.replay_mode = resolve_replay(ctx, a)
     # local work must fit well inside this commit's share of the time limit
     blind, local = decide(ctx, a, max_local_ms=max(0.0, (deadline - time.monotonic()) * 1000 * 0.6))
     if local:
@@ -886,7 +982,7 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes})
     failed = set()
     if local:
-        failed = run_local(ctx, set(local), deadline, blind)
+        failed = run_local(ctx, set(local), deadline, blind, a.replay_mode & set(local))
     send({"stage": "done", "failed": sorted(failed)})
 
 
@@ -912,10 +1008,18 @@ def main():
         maps = pickle.load(f)
     with open(os.path.join(MAPS, "fp.pkl"), "rb") as f:
         pristine = pickle.load(f)
+    replay_data = None
+    rp = os.path.join(MAPS, "replay.pkl")
+    if os.path.exists(rp):
+        with open(rp, "rb") as f:
+            replay_data = pickle.load(f)
+    maps["_replay_data"] = replay_data
     if maps["test_ids"] != [t["id"] for t in tests]:
         log("WARNING: tests.json differs from the map; remapping by id")
         maps = remap(maps, tests)
-    ctx = Ctx(maps, tests)
+    speed = calibrate()
+    ctx = Ctx(maps, tests, speed)
+    log(f"speed factor {speed:.2f}")
     preimport(maps)
     cdir = os.path.join(DATA, "commits")
     commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
@@ -962,8 +1066,10 @@ def main():
             with open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape") as f:
                 text = f.read()
             remaining = global_deadline - time.monotonic()
-            share = remaining * PARALLEL / max(1, len(pending) + len(running) + 1)
-            per = max(1.0, min(share, remaining))
+            # most commits take well under a second: keep a reserve for the
+            # ones still waiting and let this one use the rest
+            reserve = RESERVE_PER_COMMIT * ctx.speed * len(pending) / PARALLEL
+            per = max(1.0, min(remaining - reserve, remaining))
             deadline = time.monotonic() + per
             r, w = os.pipe()
             pid = os.fork()

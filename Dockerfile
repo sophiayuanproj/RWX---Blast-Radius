@@ -20,7 +20,8 @@ COPY vendor/sqlglot-eb11aec.tar.xz /tmp/sqlglot.tar.xz
 RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot.tar.xz').extractall('/app/src', filter='data')" \
  && rm /tmp/sqlglot.tar.xz
 
-COPY selector.py brlib.py brfp.py brpool.py /app/
+COPY selector.py brlib.py brfp.py brpool.py brreplay.py /app/
+COPY build/record_replay.py /app/build/record_replay.py
 COPY maps/maps.pkl.xz /app/maps/maps.pkl.xz
 
 # Bytecode for the pristine tree (the run's disk is read-only), then the
@@ -31,7 +32,8 @@ RUN python -c "import lzma, shutil; shutil.copyfileobj(lzma.open('/app/maps/maps
  && cd /app/src \
  && python -m compileall -q -j 4 sqlglot tests \
  && BR_MAPS_PKL=/app/maps/maps.pkl PYTHONPATH=/app/src python /app/brfp.py /app/maps/fp.pkl 1 2 3 4 5 \
- && python -m compileall -q /app/selector.py /app/brlib.py /app/brfp.py /app/brpool.py \
+ && (PYTHONPATH=/app/src python /app/build/record_replay.py /app/src /app/maps/replay.pkl || rm -f /app/maps/replay.pkl) \
+ && python -m compileall -q /app/selector.py /app/brlib.py /app/brfp.py /app/brpool.py /app/brreplay.py \
  && chmod -R a+rX /app
 
 CMD ["python", "/app/selector.py"]

@@ -28,6 +28,22 @@ to never guess. It either proves a test unaffected, runs the test, or hands it t
    remaining candidates move to CI if that is cheaper. A test that errors, times out,
    cannot be loaded, or does not finish counts as failing.
 
+## Replaying the TPC-H / TPC-DS executor tests
+
+Most of an executor test's time goes to sqlglot's Python executor and to DuckDB
+computing the expected results. Neither depends on the patch when only the front
+end (parse, optimize, transpile) can change. The tracer records that front end
+separately for these tests. When a patch reaches only the front end, the test runs
+here in replay mode (`brreplay.py`). The front end runs for real; executor and DuckDB
+results come from recordings made at image build time, keyed by a structural digest of
+the optimized query and by the exact DuckDB SQL. Any input the pinned commit never
+produced counts as a failure, so the test goes to CI. The TPC-DS test drops from about
+28 s of CPU to about 3 s.
+
+The selector also times a short benchmark at startup and scales its local cost
+estimates when the machine is clearly slower or faster than the one they were
+measured on.
+
 ## The maps (`maps/maps.pkl`)
 
 These are recorded once at the pinned commit by `build/trace_plugin.py`, a pytest
@@ -48,7 +64,7 @@ To rebuild the maps, see `build/make_maps.sh`.
 
 ## Validation
 
-- Sample set, 30 commits: about 149 s simulated plus about 7 s CPU, with 0 misses. The
+- Sample set, 30 commits: about 132 s simulated plus about 9 s CPU, with 0 misses. The
   starter scores 1,614 s; an oracle that selects exactly the failing tests scores 94 s.
 - Mutation harness (`tools/gen.py` and `tools/label.py`), labeled by running the full
   suite under pytest with the same failure rules as the event: operator swaps, constant
@@ -69,6 +85,7 @@ roughly a ninth of a single miss.
 | `brlib.py` | patch parsing and applying, code-object diff |
 | `brfp.py` | fingerprints of module globals and class attributes |
 | `brpool.py` | in-process `ProcessPoolExecutor` stand-in |
+| `brreplay.py` | replay of the executor tests' expensive parts |
 | `maps/maps.pkl` | per-test maps recorded at the pinned commit |
 | `vendor/sqlglot-eb11aec.tar.xz` | `git archive` of sqlglot at the pinned commit |
 | `build/` | scripts that produce the maps |
