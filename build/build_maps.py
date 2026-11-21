@@ -81,6 +81,17 @@ for key, b in buckets.items():
         collect[rest] = b
     elif phase == "outer":
         outer[rest] = b
+    elif phase == "execr":
+        # executor region of a replayable test: part of the test and of its
+        # "everything but the front end" pseudo test
+        if rest in num:
+            dst = per_test[num[rest]]
+            for f in dst:
+                dst[f] |= b[f]
+        else:
+            unknown.add(rest)
+    elif phase not in ("<preimport>", "<import>", "<postimport>", "<between>") and not key.startswith("<"):
+        raise SystemExit(f"unhandled trace bucket {key!r}: coverage would be lost")
 if unknown:
     print("tests not in tests.json:", sorted(unknown), file=sys.stderr)
 
@@ -265,6 +276,7 @@ sys.path.insert(0, root)
 import brfp  # noqa: E402
 
 brfp.import_all()
+reg = brfp.class_registry()
 descendants = {}
 class_file = {}
 for modname in brfp.sqlglot_modules():
@@ -282,7 +294,7 @@ for modname in brfp.sqlglot_modules():
             for s in type.__subclasses__(c) if isinstance(c, type) else []:
                 if id(s) not in ids:
                     ids.add(id(s))
-                    seen.append(f"{s.__module__}:{s.__qualname__}")
+                    seen.append(reg.get(id(s), f"{s.__module__}:{s.__qualname__}"))
                     stack.append(s)
         descendants[key] = seen
 

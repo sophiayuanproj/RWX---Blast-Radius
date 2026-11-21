@@ -194,43 +194,42 @@ def _is_plain(v):
     return True
 
 
+CLASS_KEYS = {}
+
+
 def _install_attr_tracking():
+    import brfp
+
     seen = set()
     count = 0
-
-    def visit(cls, modname):
-        nonlocal count
-        if id(cls) in seen:
-            return
-        seen.add(id(cls))
-        if issubclass(cls, enum.Enum) or issubclass(cls, BaseException):
-            return
-        for name, v in list(cls.__dict__.items()):
-            if name.startswith("__") and name.endswith("__"):
-                continue
-            if isinstance(v, type) and v.__module__ == modname and v.__qualname__.startswith(cls.__qualname__ + "."):
-                visit(v, modname)
-            if not _is_plain(v):
-                continue
-            k = len(ATTR_KEYS)
-            ATTR_KEYS.append(f"{modname}:{cls.__qualname__}.{name}")
-            if type(v) is dict and os.environ.get("TRACK_KEYS", "1") == "1":
-                rd = _RecDict(v)
-                rd._k = k
-                v = rd
-            ATTR_INDEX[(id(cls), name)] = k
-            try:
-                setattr(cls, name, _Rec(v, k))
-                count += 1
-            except (TypeError, AttributeError):
-                ATTR_KEYS[k] = None
-
-    for modname, mod in list(sys.modules.items()):
-        if not modname.startswith("sqlglot") or mod is None:
+    CLASS_KEYS.update(brfp.class_registry())
+    for modname in brfp.sqlglot_modules():
+        mod = sys.modules.get(modname)
+        if mod is None:
             continue
-        for v in list(vars(mod).values()):
-            if isinstance(v, type) and v.__module__ == modname:
-                visit(v, modname)
+        for qual, cls in brfp.module_classes(mod):
+            if id(cls) in seen:
+                continue
+            seen.add(id(cls))
+            if issubclass(cls, enum.Enum) or issubclass(cls, BaseException):
+                continue
+            for name, v in list(cls.__dict__.items()):
+                if name.startswith("__") and name.endswith("__"):
+                    continue
+                if not _is_plain(v):
+                    continue
+                k = len(ATTR_KEYS)
+                ATTR_KEYS.append(f"{modname}:{qual}.{name}")
+                if type(v) is dict and os.environ.get("TRACK_KEYS", "1") == "1":
+                    rd = _RecDict(v)
+                    rd._k = k
+                    v = rd
+                ATTR_INDEX[(id(cls), name)] = k
+                try:
+                    setattr(cls, name, _Rec(v, k))
+                    count += 1
+                except (TypeError, AttributeError):
+                    ATTR_KEYS[k] = None
     print(f"[trace] tracking {count} class attributes", file=sys.stderr)
 
 
@@ -405,6 +404,9 @@ def _keyfp(key):
 def _cname(t):
     if t is None:
         return None
+    k = CLASS_KEYS.get(id(t))
+    if k is not None:
+        return k
     return f"{getattr(t, '__module__', '?')}:{getattr(t, '__qualname__', '?')}"
 
 

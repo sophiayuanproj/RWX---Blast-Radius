@@ -6,7 +6,10 @@ import brpool
 brpool.install()
 sys.path.insert(0, root); os.chdir(root)
 tests = json.load(open(tests_json))["tests"]
-cpu = [None] * len(tests)
+only = os.environ.get("ONLY_FILE")
+if only:
+    tests = [t for t in tests if t["file"] == only]
+cpu = {}
 devnull = os.open(os.devnull, os.O_WRONLY); os.dup2(devnull, 1)
 t_import = {}
 gap = {}

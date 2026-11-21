@@ -266,29 +266,54 @@ def import_all(prefix="sqlglot"):
     return errors
 
 
+def _is_named(cls):
+    """True if the class can be reached by its module and qualified name."""
+    mod = sys.modules.get(getattr(cls, "__module__", None) or "")
+    obj = mod
+    for part in (getattr(cls, "__qualname__", "") or "").split("."):
+        if obj is None or part == "<locals>":
+            return False
+        obj = getattr(obj, part, None) if not isinstance(obj, type) else obj.__dict__.get(part)
+    return obj is cls
+
+
 def module_classes(mod):
-    """Classes defined in mod, including nested ones, as (qualname, cls)."""
+    """Classes of mod as (qualname, cls): module-level classes, their nested
+    classes, and classes made on the fly (e.g. a dialect's Tokenizer built with
+    type()) reachable only through a class attribute, named by that path."""
     out = []
     seen = set()
     modname = mod.__name__
 
-    def visit(cls):
+    def visit(cls, qual):
         if id(cls) in seen:
             return
         seen.add(id(cls))
-        out.append((cls.__qualname__, cls))
-        for v in list(cls.__dict__.values()):
-            if (
-                isinstance(v, type)
-                and v.__module__ == modname
-                and v.__qualname__.startswith(cls.__qualname__ + ".")
-            ):
-                visit(v)
+        out.append((qual, cls))
+        for name, v in list(cls.__dict__.items()):
+            if not isinstance(v, type) or not (getattr(v, "__module__", "") or "").startswith("sqlglot"):
+                continue
+            if v.__module__ == modname and v.__qualname__.startswith(cls.__qualname__ + ".") and _is_named(v):
+                visit(v, v.__qualname__)
+            elif not _is_named(v):
+                visit(v, f"{qual}.{name}")
 
     for v in list(vars(mod).values()):
         if isinstance(v, type) and v.__module__ == modname:
-            visit(v)
+            visit(v, v.__qualname__)
     return out
+
+
+def class_registry():
+    """id(class) -> "module:qual", the canonical key of every sqlglot class."""
+    reg = {}
+    for modname in sqlglot_modules():
+        mod = sys.modules.get(modname)
+        if mod is None:
+            continue
+        for qual, cls in module_classes(mod):
+            reg.setdefault(id(cls), f"{modname}:{qual}")
+    return reg
 
 
 def fingerprint_modules(modnames, unordered=False, only=None):
