@@ -66,6 +66,14 @@ outer = {}  # front-end coverage of replayable tests (see brreplay)
 execr = {}  # executor coverage of replayable tests
 data_region = {}  # table-data preparation inside replayable tests' calls
 unknown = set()
+import dis  # noqa: E402
+
+line_tests_pre = defaultdict(int)
+for key, b in buckets.items():
+    phase, _, rest = key.partition(":")
+    if phase in ("call", "outer", "execr", "data") and rest in num:
+        for fl in b.get("lines", ()):
+            line_tests_pre[fl] |= 1 << num[rest]
 for key, b in buckets.items():
     phase, _, rest = key.partition(":")
     if phase in ("setup", "call", "teardown"):
@@ -92,13 +100,61 @@ for key, b in buckets.items():
 if unknown:
     print("tests not in tests.json:", sorted(unknown), file=sys.stderr)
 
+# fixture files a class fixture loads into a class attribute
+# (cls.X = ...("path/file.sql")...): only tests reading X depend on them
+import ast as _ast
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from brlib import all_codes  # noqa: E402
+
+setup_links = {}  # (test file, class name) -> {fixture rel path: attr}
+for tf in sorted({t["file"] for t in tests}):
+    try:
+        tree = _ast.parse(open(os.path.join(root, tf), encoding="utf-8").read())
+    except (OSError, SyntaxError):
+        continue
+    for node in tree.body:
+        if not isinstance(node, _ast.ClassDef):
+            continue
+        for fn in node.body:
+            if isinstance(fn, _ast.FunctionDef) and fn.name == "setUpClass":
+                for st in _ast.walk(fn):
+                    if isinstance(st, _ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], _ast.Attribute):
+                        strs = [c.value for c in _ast.walk(st.value) if isinstance(c, _ast.Constant) and isinstance(c.value, str)]
+                        for sv in strs:
+                            if sv.endswith((".sql", ".json", ".csv", ".txt")):
+                                setup_links.setdefault((tf, node.name), {})["tests/fixtures/" + sv] = st.targets[0].attr
+attr_line_readers = defaultdict(int)  # (test file, attr) -> tests running a load of attr there
+for tf in {k[0] for k in setup_links}:
+    try:
+        co = compile(open(os.path.join(root, tf), encoding="utf-8").read(), tf, "exec", dont_inherit=True)
+    except (OSError, SyntaxError):
+        continue
+    wanted = {a for (f2, _c), m in setup_links.items() if f2 == tf for a in m.values()}
+    for c in all_codes(co):
+        for ins in dis.get_instructions(c):
+            if ins.opname in ("LOAD_ATTR", "LOAD_METHOD") and ins.argval in wanted and ins.positions and ins.positions.lineno:
+                attr_line_readers[(tf, ins.argval)] |= line_tests_pre.get((tf, ins.positions.lineno), 0)
+linked_setup_files = {}
+for (tf, cname), m in setup_links.items():
+    for fx, attr in m.items():
+        linked_setup_files[(f"{tf[:-3].replace('/', '.')}.{cname}", fx)] = attr_line_readers.get((tf, attr), None)
+print("setup-loaded fixtures:", {k[1]: (bin(v).count("1") if v is not None else None) for k, v in linked_setup_files.items()}, file=sys.stderr)
+
 for t in tests:
     n = t["number"]
     d = per_test[n]
     cf = class_fixture.get(cls_of(t["id"]))
     if cf:
+        cname = t["file"][:-3].replace("/", ".") + "." + cls_of(t["id"]).rsplit("::", 1)[1]
         for f in d:
-            d[f] |= cf[f]
+            if f == "opens":
+                for fx in cf[f]:
+                    readers = linked_setup_files.get((cname, fx))
+                    if readers is None or (readers >> n) & 1:
+                        d[f].add(fx)
+            else:
+                d[f] |= cf[f]
     cb = collect.get(t["file"])
     if cb:
         for f in d:
@@ -133,10 +189,14 @@ for tid in brreplay.REPLAY_TESTS:
     keep = {f: set() for f in per_test[n]}
     cf = class_fixture.get(cls_of(tid))
     cb = collect.get(tid.split("::", 1)[0])
+    cname = tid.split("::", 1)[0][:-3].replace("/", ".") + "." + tid.split("::")[1]
     for src in (cf, cb, data_region.get(tid)):
         if src:
             for f in keep:
                 keep[f] |= src.get(f, set())
+    # query files loaded into class attributes reach the replayed parts only
+    # through their SQL, which keys the recordings
+    keep["opens"] = {fx for fx in keep["opens"] if (cname, fx) not in linked_setup_files}
     per_test[p] = keep
     for f in per_test[n]:
         per_test[n][f] |= outer[tid].get(f, set())
