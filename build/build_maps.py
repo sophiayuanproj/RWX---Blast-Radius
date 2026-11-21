@@ -443,6 +443,7 @@ maps = {
     "key_tests": intern(key_tests),
     "lazy_import_tests": dict(lazy_import_tests),
     "replay": replay,
+    "setup_linked_files": sorted({fx for (_c, fx) in linked_setup_files}),
     "attr_via_tests": intern(attr_via_tests),
     "replay_exec": replay_exec,
     "name_global_tests": intern(name_global_tests),

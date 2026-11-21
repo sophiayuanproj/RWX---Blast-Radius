@@ -179,8 +179,9 @@ class _Conn:
             if key in self._store:
                 return _FakeResult(pickle.loads(self._store[key]))
             # a query the pinned commit never ran: run it for real
-            if self._real is None:
+            if self._real is None or self._hooks.duck_left <= 0:
                 raise Diverge("duckdb query not recorded")
+            self._hooks.duck_left -= 1
             with self._hooks.spending():
                 df = self._real.execute(sql, *a, **kw).fetchdf()
             return _FakeResult(df)
@@ -202,6 +203,8 @@ class Hooks:
         self.budget = budget  # cpu seconds allowed for real fallbacks per test
         self.spent = 0.0
         self.real_keys = frozenset()
+        self.unknown_left = 0  # unrecorded executor inputs allowed to run for real
+        self.duck_left = 0  # unrecorded DuckDB queries allowed to run for real
         self.active = False
         self._saved = []
         self._last = []
@@ -246,6 +249,11 @@ class Hooks:
             key = exec_key(expr, self_) if expr is not None else None
             store = hooks.data["exec"]
             if hooks.mode == "replay":
+                if (key is None or key not in store) and hooks.unknown_left > 0:
+                    # a query the pinned commit never ran (its SQL was edited):
+                    # execute it for real, a few at most
+                    hooks.unknown_left -= 1
+                    return orig_exec(self_, plan)
                 if key is not None and key in hooks.real_keys and key in store:
                     # this query reaches changed executor code: run it, and
                     # stop at once if it no longer gives the pinned result

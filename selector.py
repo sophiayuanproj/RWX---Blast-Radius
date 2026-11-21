@@ -258,6 +258,7 @@ class Analysis:
         self.check_test_imports = False
         self.cands_fn = 0  # candidates from changed function bodies (lines known)
         self.changed_lines = set()  # (path, old line) deciding those changes
+        self.hunks_by_file = {}
 
     def note(self, s):
         self.notes.append(s)
@@ -320,6 +321,7 @@ def analyse_static(ctx, patch_text):
         if fp.rename and fp.old_path:
             a.files[fp.old_path] = None
         a.files[fp.path] = new_text
+        a.hunks_by_file[fp.path] = fp.hunks
 
         path = fp.path or fp.old_path
         if not path.endswith(".py") and not (fp.old_path or "").endswith(".py"):
@@ -910,7 +912,12 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
             if hooks is not None and n in replay:
                 try:
                     hooks.budget = REPLAY_BUDGET * tests[n]["seconds"] / ctx.speed
-                    hooks.real_keys = replay[n]
+                    rk = set(replay[n])
+                    unk = [x for x in rk if isinstance(x, tuple) and x and x[0] == "__unknown__"]
+                    rk -= set(unk)
+                    hooks.real_keys = rk
+                    hooks.unknown_left = 3 * unk[0][1] if unk else 0
+                    hooks.duck_left = 3 * unk[0][1] if unk else 0
                     hooks.install(test)
                 except BaseException as e:  # noqa: BLE001
                     log(f"  replay hooks failed: {e!r}")
@@ -1051,6 +1058,13 @@ def resolve_replay(ctx, a):
                 continue
             real = {k for k, lines in cov.items() if lines & a.changed_lines}
         extra = sum(data.get("exec_cpu", {}).get(k, 0.0) for k in real)
+        # its query file edited: the few queries with new SQL run for real
+        edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
+        if edited:
+            nh = sum(len(a.hunks_by_file.get(f, [])) for f in edited) or 1
+            real = set(real) | {("__unknown__", nh)}
+            avg = (sum(data.get("exec_cpu", {}).values()) / max(1, len(data.get("exec_cpu", {})))) or 0.5
+            extra += nh * (avg + 0.3)
         mode[t] = real
         ctx.local_ms[t] = (cpu + extra) * 1000 * ctx.speed
         if not real and REPLAY_BUDGET == 0 and data.get("light_setup_cpu") is not None:
