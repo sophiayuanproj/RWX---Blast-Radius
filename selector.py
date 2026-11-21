@@ -35,6 +35,7 @@ REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0.5"))  # share of a t
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
+ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "1") == "1"  # verify every candidate here (measurement)
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
 WORKER_COST = 2000  # ms
@@ -952,7 +953,7 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
                 if rest:
                     base = blind + sorted(failed)
                     inc = pack(base + rest, ctx.ms)[0] - pack(base, ctx.ms)[0]
-                    if inc < ctx.local_cost(rest) - LOCAL_FIXED * 1000 * ctx.speed:
+                    if not ALL_LOCAL and inc < ctx.local_cost(rest) - LOCAL_FIXED * 1000 * ctx.speed:
                         log(f"  stopping after failure: {len(rest)} left go to CI")
                         self.shouldStop = True
 
@@ -1159,6 +1160,9 @@ def decide(ctx, a, max_local_ms=float("inf")):
     cands = [n for n in bits_list(a.cands & ~a.must)]
     if not cands:
         return must, []
+    if ALL_LOCAL:
+        cheap = [n for n in cands if ctx.local_ms[n] <= 8000 * ctx.speed]
+        return must + [n for n in cands if n not in set(cheap)], cheap
     blind_base = list(must)
     best = (pack(blind_base + cands, ms)[0], cands, [])  # everything blind
     orders = (
