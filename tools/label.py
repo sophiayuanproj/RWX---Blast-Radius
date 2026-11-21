@@ -21,9 +21,15 @@ for f in sorted(os.listdir(os.path.join(mdir, "commits"))):
     out = f"/tmp/label_{cid}.json"
     t0 = time.time()
     env = {**os.environ, "PYTHONPATH": work + ":/home/claude/br/build", "LABEL_OUT": out}
-    subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "labelplug", "-p", "no:cacheprovider", "-n", "2",
-                    "--timeout", "300", "tests"], cwd=work, env=env, capture_output=True, text=True)
-    lab = json.load(open(out))
+    try:
+        subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "labelplug", "-p", "no:cacheprovider", "-n", "2",
+                        "--timeout", "300", "tests"], cwd=work, env=env, capture_output=True, text=True, timeout=420)
+        lab = json.load(open(out))
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        print(cid, "skipped: suite did not finish", flush=True)
+        subprocess.run(["pkill", "-9", "-f", "sys.stdin.readline"])
+        shutil.rmtree(work, ignore_errors=True)
+        continue
     failing = set()
     unknown = []
     for nid in lab["failed"]:

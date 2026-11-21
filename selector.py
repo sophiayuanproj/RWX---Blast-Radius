@@ -853,6 +853,10 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
 
     signal.signal(signal.SIGPROF, on_alarm)
     result = Result()
+    if os.environ.get("BR_GC_THRESH"):
+        import gc
+
+        gc.set_threshold(int(os.environ["BR_GC_THRESH"]), 50, 100)
     # the first failing subtest decides the test: stop it there (our add*
     # methods never call stop(), so the suite itself carries on)
     result.failfast = True
@@ -1021,6 +1025,12 @@ def main():
     ctx = Ctx(maps, tests, speed)
     log(f"speed factor {speed:.2f}")
     preimport(maps)
+    if os.environ.get("BR_GC_FREEZE", "1") == "1":
+        import gc
+
+        # the maps are millions of objects: keep the children's collector off them
+        gc.collect()
+        gc.freeze()
     cdir = os.path.join(DATA, "commits")
     commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
     n = len(commits)
