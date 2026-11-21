@@ -206,6 +206,7 @@ class Hooks:
         self.unknown_left = 0  # unrecorded executor inputs allowed to run for real
         self.duck_left = 0  # unrecorded DuckDB queries allowed to run for real
         self.active = False
+        self.abort = False  # set once the running test has a failed subtest
         self._saved = []
         self._last = []
 
@@ -249,6 +250,8 @@ class Hooks:
             key = exec_key(expr, self_) if expr is not None else None
             store = hooks.data["exec"]
             if hooks.mode == "replay":
+                if hooks.abort:
+                    raise Diverge("an earlier query failed")
                 if (key is None or key not in store) and hooks.unknown_left > 0:
                     # a query the pinned commit never ran (its SQL was edited):
                     # execute it for real, a few at most
