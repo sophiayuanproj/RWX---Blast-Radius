@@ -332,15 +332,16 @@ def _phase(item, phase):
     _switch(f"{phase}:{item.nodeid}")
 
 
-def _outer(fn):
-    """Calls into the front end of a replayable test are recorded apart."""
+def _outer(fn, region="outer"):
+    """Calls into the front end (or the executor) of a replayable test are
+    recorded apart."""
 
     def wrapper(*a, **kw):
         c = CURRENT[0]
         if c is None or c[1] not in _REPLAY or _OUTER_DEPTH[0]:
             return fn(*a, **kw)
         _OUTER_DEPTH[0] += 1
-        _switch(f"outer:{c[1]}")
+        _switch(f"{region}:{c[1]}")
         try:
             return fn(*a, **kw)
         finally:
@@ -360,6 +361,10 @@ def pytest_collection_finish(session):
     import sqlglot.executor as ex
 
     ex.optimize = _outer(ex.optimize)
+    ex.Plan = _outer(ex.Plan, "execr")
+    import sqlglot.executor.python as py
+
+    py.PythonExecutor.execute = _outer(py.PythonExecutor.execute, "execr")
     mod = sys.modules.get(brreplay.TEST_MODULE)
     if mod is not None:
         for name in ("parse_one", "transpile"):

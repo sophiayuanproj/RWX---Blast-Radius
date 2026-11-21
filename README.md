@@ -40,6 +40,11 @@ the optimized query and by the exact DuckDB SQL. Any input the pinned commit nev
 produced counts as a failure, so the test goes to CI. The TPC-DS test drops from about
 28 s of CPU to about 3 s.
 
+Changes inside the executor itself are handled per query. The recordings also hold
+the lines each query ran in the planner and executor. Only the queries reaching
+changed lines are executed for real, and each must reproduce its recorded result
+exactly; the first one that doesn't stops the test, which then goes to CI.
+
 The selector also times a short benchmark at startup and scales its local cost
 estimates when the machine is clearly slower or faster than the one they were
 measured on.

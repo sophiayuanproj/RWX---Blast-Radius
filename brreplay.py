@@ -108,6 +108,51 @@ def exec_key(expression, executor):
     return expr_digest(expression) + "|" + names
 
 
+class _LineRecorder:
+    """sqlglot lines run inside a block (build time only)."""
+
+    TOOL = 5
+
+    def __enter__(self):
+        import sys
+
+        self.lines = set()
+        mon = sys.monitoring
+        lines = self.lines
+
+        def on_line(code, line):
+            f = code.co_filename
+            i = f.rfind("/sqlglot/")
+            if i >= 0:
+                lines.add((f[i + 1:], line))
+            return mon.DISABLE
+
+        try:
+            mon.use_tool_id(self.TOOL, "brreplay")
+        except ValueError:
+            pass
+        mon.register_callback(self.TOOL, mon.events.LINE, on_line)
+        mon.set_events(self.TOOL, mon.events.LINE)
+        mon.restart_events()
+        return self
+
+    def __exit__(self, *exc):
+        import sys
+
+        mon = sys.monitoring
+        mon.set_events(self.TOOL, 0)
+        mon.register_callback(self.TOOL, mon.events.LINE, None)
+        mon.free_tool_id(self.TOOL)
+        return False
+
+
+def same_table(a, b):
+    try:
+        return list(a.columns) == list(b.columns) and list(a.rows) == list(b.rows)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class _FakeResult:
     def __init__(self, df):
         self._df = df
@@ -156,6 +201,7 @@ class Hooks:
         self.mode = mode
         self.budget = budget  # cpu seconds allowed for real fallbacks per test
         self.spent = 0.0
+        self.real_keys = frozenset()
         self.active = False
         self._saved = []
         self._last = []
@@ -200,20 +246,52 @@ class Hooks:
             key = exec_key(expr, self_) if expr is not None else None
             store = hooks.data["exec"]
             if hooks.mode == "replay":
+                if key is not None and key in hooks.real_keys and key in store:
+                    # this query reaches changed executor code: run it, and
+                    # stop at once if it no longer gives the pinned result
+                    r = orig_exec(self_, plan)
+                    if not same_table(r, pickle.loads(store[key])):
+                        raise Diverge("executor result changed")
+                    return r
                 if key is not None and key in store:
                     return pickle.loads(store[key])
                 # an input the pinned commit never produced: execute it (the
                 # executor's own code is unchanged when replay is used)
                 with hooks.spending():
                     return orig_exec(self_, plan)
-            r = orig_exec(self_, plan)
+            cov = hooks.data.setdefault("cov", {})
+            cpu = hooks.data.setdefault("exec_cpu", {})
+            import time as _t
+
+            t0 = _t.process_time()
+            with _LineRecorder() as rec:
+                r = orig_exec(self_, plan)
             if key is not None:
                 store[key] = pickle.dumps(r)
+                cov[key] = frozenset(rec.lines | plan_lines.pop(id(plan), set()))
+                cpu[key] = _t.process_time() - t0 + plan_cpu.pop(id(plan), 0.0)
             return r
+
+        plan_lines = {}
+        plan_cpu = {}
+        orig_plan = ex.Plan
+
+        def plan_rec(expression):
+            import time as _t
+
+            t0 = _t.process_time()
+            with _LineRecorder() as rec:
+                p = orig_plan(expression)
+            plan_lines[id(p)] = rec.lines
+            plan_cpu[id(p)] = _t.process_time() - t0
+            return p
 
         self._saved = [(ex, "optimize", ex.optimize), (py.PythonExecutor, "execute", orig_exec)]
         ex.optimize = optimize
         py.PythonExecutor.execute = execute
+        if self.mode == "record":
+            self._saved.append((ex, "Plan", orig_plan))
+            ex.Plan = plan_rec
         cls = type(test)
         for attr in ("tpch_conn", "tpcds_conn"):
             if attr in cls.__dict__:

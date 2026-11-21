@@ -63,6 +63,7 @@ per_test = defaultdict(lambda: {f: set() for f in FIELDS})
 class_fixture = defaultdict(lambda: {f: set() for f in FIELDS})
 collect = {}
 outer = {}  # front-end coverage of replayable tests (see brreplay)
+execr = {}  # executor coverage of replayable tests
 unknown = set()
 for key, b in buckets.items():
     phase, _, rest = key.partition(":")
@@ -82,14 +83,7 @@ for key, b in buckets.items():
     elif phase == "outer":
         outer[rest] = b
     elif phase == "execr":
-        # executor region of a replayable test: part of the test and of its
-        # "everything but the front end" pseudo test
-        if rest in num:
-            dst = per_test[num[rest]]
-            for f in dst:
-                dst[f] |= b[f]
-        else:
-            unknown.add(rest)
+        execr[rest] = b
     elif phase not in ("<preimport>", "<import>", "<postimport>", "<between>") and not key.startswith("<"):
         raise SystemExit(f"unhandled trace bucket {key!r}: coverage would be lost")
 if unknown:
@@ -112,13 +106,19 @@ for t in tests:
 # replayable tests: their own number gets everything, a pseudo number (after
 # the real ones) gets everything except the front end
 replay = {}
+replay_exec = {}
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import brreplay  # noqa: E402
 
 next_pseudo = len(tests)
+for tid in set(execr) - set(brreplay.REPLAY_TESTS):
+    raise SystemExit(f"executor region traced for a test without replay: {tid}")
 for tid in brreplay.REPLAY_TESTS:
     if tid not in num or tid not in outer:
         print("no outer coverage for", tid, file=sys.stderr)
+        if tid in num and tid in execr:
+            for f in per_test[num[tid]]:
+                per_test[num[tid]][f] |= execr[tid].get(f, set())
         continue
     n = num[tid]
     p = next_pseudo
@@ -127,6 +127,14 @@ for tid in brreplay.REPLAY_TESTS:
     per_test[p] = {f: set(v) for f, v in per_test[n].items()}
     for f in per_test[n]:
         per_test[n][f] |= outer[tid].get(f, set())
+    if tid in execr:
+        # a second pseudo test holds the executor region alone
+        p2 = next_pseudo
+        next_pseudo += 1
+        replay_exec[n] = p2
+        per_test[p2] = {f: set(execr[tid].get(f, set())) for f in per_test[n]}
+        for f in per_test[n]:
+            per_test[n][f] |= execr[tid].get(f, set())
     print(f"replay {tid}: inner codes {len(per_test[p]['codes'])}, all {len(per_test[n]['codes'])}", file=sys.stderr)
 
 missing = [t["id"] for t in tests if not per_test[t["number"]]["codes"]]
@@ -358,6 +366,7 @@ maps = {
     "key_tests": intern(key_tests),
     "lazy_import_tests": dict(lazy_import_tests),
     "replay": replay,
+    "replay_exec": replay_exec,
     "name_global_tests": intern(name_global_tests),
     "name_attr_tests": intern(name_attr_tests),
     "keyany_tests": intern(keyany_tests),

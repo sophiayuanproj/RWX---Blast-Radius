@@ -251,6 +251,8 @@ class Analysis:
         self.data_cands = 0  # candidates only because they read a changed data file
         self.lazy_load = False
         self.check_test_imports = False
+        self.cands_fn = 0  # candidates from changed function bodies (lines known)
+        self.changed_lines = set()  # (path, old line) deciding those changes
 
     def note(self, s):
         self.notes.append(s)
@@ -389,9 +391,12 @@ def analyse_static(ctx, patch_text):
                 if fine is not None:
                     a.note(f"{path}:{co.co_qualname} {kind} -> {popcount(bits)} (lines: {popcount(fine & bits)})")
                     bits &= fine
+                    a.changed_lines |= {(path, l) for l in fine_lines(stmt_index, co, hunk_lines)}
                 else:
                     a.note(f"{path}:{co.co_qualname} {kind} -> {popcount(bits)}")
-                a.cands |= bits
+                    a.changed_lines |= {(path, l) for l in brlib.code_line_span(co)}
+                    a.changed_lines.add((path, co.co_firstlineno))
+                a.cands_fn |= bits
                 if key in ctx.import_codes:
                     a.need_fp = True
                     _add_fp_module(a, mod, in_pkg)
@@ -417,6 +422,21 @@ def analyse_static(ctx, patch_text):
                 else:
                     a.must |= ctx.all_bits
     return a
+
+
+def fine_lines(si, co, hunk_lines):
+    """The deciding lines narrow_by_lines used (it succeeded for co)."""
+    span = brlib.code_line_span(co)
+    lo, hi = min(min(span), co.co_firstlineno), max(span)
+    for start, end, n, _p in si.nodes:
+        if getattr(n, "lineno", None) == co.co_firstlineno or start == co.co_firstlineno:
+            hi = max(hi, end)
+            break
+    out = set()
+    for l in hunk_lines:
+        if lo <= l <= hi:
+            out |= si.deciding_lines(l, lo, hi) or set(range(lo, hi + 1))
+    return out
 
 
 def narrow_by_lines(si, co, hunk_lines, file_lines):
@@ -756,7 +776,7 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
     if hooks is not None and REPLAY_BUDGET == 0:
         classes = {type(loaded[n]) for n in replay if n in loaded}
         for cls in classes:
-            if all(n in replay for n in loaded if type(loaded[n]) is cls):
+            if all(n in replay and not replay[n] for n in loaded if type(loaded[n]) is cls):
                 restore_setup = brreplay.light_setup(cls)
     suite = unittest.TestSuite([loaded[n] for n in run_order if n in loaded])
     started = set()
@@ -791,6 +811,7 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
             if hooks is not None and n in replay:
                 try:
                     hooks.budget = REPLAY_BUDGET * tests[n]["seconds"] / ctx.speed
+                    hooks.real_keys = replay[n]
                     hooks.install(test)
                 except BaseException as e:  # noqa: BLE001
                     log(f"  replay hooks failed: {e!r}")
@@ -897,34 +918,51 @@ def expected_local(ctx, a, blind, local):
 
 
 def resolve_replay(ctx, a):
-    """Fold the pseudo tests (front end excluded) back into their tests and
-    pick the tests whose change can only reach their front end."""
-    mode = set()
+    """Fold the pseudo tests (everything but the front end; the executor alone)
+    back into their tests, and pick the replayable tests a replay can verify:
+    nothing outside the front end and the executor is reached, and executor
+    changes are function bodies with known lines (the queries reaching them
+    run for real and must give the pinned result)."""
+    mode = {}
     rmap = ctx.maps.get("replay") or {}
+    emap = ctx.maps.get("replay_exec") or {}
     data = ctx.maps.get("_replay_data")
     import brreplay
 
     test_file_changed = brreplay.TEST_FILE in a.files
+    other = a.cands | a.must
     for t, p in rmap.items():
-        inner = ((a.cands | a.must) >> p) & 1
-        a.cands &= ~(1 << p)
-        a.must &= ~(1 << p)
-        a.data_cands &= ~(1 << p)
-        if not ((a.cands >> t) & 1) or ((a.must >> t) & 1) or inner or test_file_changed or not data:
+        inner = (other >> p) & 1 or (a.cands_fn >> p) & 1
+        p2 = emap.get(t)
+        exec_other = p2 is not None and (other >> p2) & 1
+        exec_fn = p2 is not None and (a.cands_fn >> p2) & 1
+        if exec_fn and os.environ.get("BR_NO_EXEC_REPLAY"):
+            exec_other = True
+        hit = ((other | a.cands_fn) >> t) & 1
+        if not hit or ((a.must >> t) & 1) or inner or exec_other or test_file_changed or not data:
             continue
         tid = ctx.tests[t]["id"]
         cpu = (data.get("cpu") or {}).get(tid)
         if cpu is None:
             continue
-        mode.add(t)
-        ctx.local_ms[t] = cpu * 1000 * ctx.speed
-        if REPLAY_BUDGET == 0 and data.get("light_setup_cpu") is not None:
+        real = set()
+        if exec_fn:
+            cov = data.get("cov")
+            if cov is None:
+                continue
+            real = {k for k, lines in cov.items() if lines & a.changed_lines}
+        extra = sum(data.get("exec_cpu", {}).get(k, 0.0) for k in real)
+        mode[t] = real
+        ctx.local_ms[t] = (cpu + extra) * 1000 * ctx.speed
+        if not real and REPLAY_BUDGET == 0 and data.get("light_setup_cpu") is not None:
             ctx.class_setup_ms[ctx.cls_of[t]] = data["light_setup_cpu"] * 1000 * ctx.speed
-        a.note(f"replay {tid.rsplit('::', 1)[1]}: front end only, {cpu:.2f}s cpu to verify")
-    # never let a pseudo number through
-    lim = (1 << ctx.n) - 1
+        a.note(f"replay {tid.rsplit('::', 1)[1]}: {len(real)} queries run for real, "
+               f"{cpu + extra:.2f}s cpu to verify")
+    a.cands |= a.cands_fn
+    lim = (1 << ctx.n) - 1  # never let a pseudo number through
     a.cands &= lim
     a.must &= lim
+    a.data_cands &= lim
     return mode
 
 
@@ -986,7 +1024,8 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes})
     failed = set()
     if local:
-        failed = run_local(ctx, set(local), deadline, blind, a.replay_mode & set(local))
+        failed = run_local(ctx, set(local), deadline, blind,
+                           {t: r for t, r in a.replay_mode.items() if t in set(local)})
     send({"stage": "done", "failed": sorted(failed)})
 
 
