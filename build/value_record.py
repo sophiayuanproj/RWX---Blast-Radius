@@ -115,62 +115,105 @@ def rewrite_tree(root, dst):
 # ------------------------------------------------------------- recording
 
 
-_BUILTIN_CMP = {getattr(t, n) for t in (object, str, int, float, bytes, tuple) for n in
-                ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")}
+SIG_CAP = 64  # distinct outcome signatures per (test, site); more marks it unmeasured
+PAIR_CAP = 16  # literal operand pairs kept for constant edits; more drops them
+
+_CMP_NAMES = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
+_SAFE_MODULES = {"builtins", "datetime", "_datetime", "decimal", "_decimal", "fractions", "uuid"}
+_CONTAINERS = (tuple, list, set, frozenset, dict)
+_KIND = {}
 
 
-def _safe(v, depth=0):
-    """Comparing v (and anything inside it) runs no user code."""
-    t = type(v)
+def _kind(t):
+    """How == and the orderings behave for values of type t:
+    'plain'     builtin scalars (str, int, float, None, bool, bytes)
+    'builtin'   other stdlib values with C or side-effect-free comparisons
+    'container' tuple, list, set, frozenset, dict: element comparisons
+    'identity'  object's own comparisons (identity, no ordering)
+    'expr'      sqlglot expression nodes: identity unless the same type
+    'custom'    anything else: comparing would run user code
+    """
+    k = _KIND.get(t)
+    if k is not None:
+        return k
     if t in PLAIN:
+        k = "plain"
+    elif t in _CONTAINERS:
+        k = "container"
+    elif isinstance(t, type) and issubclass(t, enum.Enum):
+        ok = all(getattr(t, n).__qualname__.split(".")[0] in ("object", "str", "int", "float", "Enum", "IntEnum",
+                                                               "StrEnum", "Flag", "IntFlag", "ReprEnum")
+                 for n in _CMP_NAMES)
+        k = "builtin" if ok else "custom"
+    elif t.__module__ in _SAFE_MODULES and type(t) is type:
+        k = "builtin"
+    elif all(getattr(t, n) is getattr(object, n) for n in _CMP_NAMES) and type(t) is type:
+        k = "identity"
+    elif (getattr(t.__eq__, "__qualname__", "") == "Expr.__eq__" and getattr(t.__ne__, "__qualname__", "") == "Expr.__ne__"
+          and all(getattr(t, n) is getattr(object, n) for n in ("__lt__", "__le__", "__gt__", "__ge__"))
+          and type(t) is type):
+        k = "expr"
+    else:
+        k = "custom"
+    _KIND[t] = k
+    return k
+
+
+def _deep_ok(v, depth=0):
+    """Comparing v element by element runs no user code."""
+    k = _kind(type(v))
+    if k in ("plain", "builtin", "identity"):
         return True
-    if depth > 2:
-        return False
-    if t in (tuple, frozenset, list, set):
-        return len(v) <= 64 and all(_safe(x, depth + 1) for x in v)
-    if t is dict:
-        return len(v) <= 64 and all(_safe(k, depth + 1) for k in v)
-    return _safe_type(t)
-
-
-def _safe_type(t):
-    """==, !=, <, <=, >, >= and hashing on values of type t run no user code."""
-    if t in PLAIN:
-        return True
-    if issubclass(t, enum.Enum):
-        return all(getattr(t, n) in _BUILTIN_CMP for n in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")) \
-            and getattr(t, "__hash__", None) in (object.__hash__, str.__hash__, int.__hash__, enum.Enum.__hash__)
-    return (all(getattr(t, n) is getattr(object, n) for n in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"))
-            and getattr(t, "__hash__", None) is object.__hash__
-            and type(t) is type)
-
-
-def _container_ok(b):
-    """`x in b` runs no user code (given a safe x)."""
-    t = type(b)
-    if t in (str, bytes):
-        return True
-    if t in (tuple, list, set, frozenset):
-        return len(b) <= 64 and all(_safe_type(type(x)) and type(x) not in (tuple,) or _safe(x) for x in b)
-    if t is dict:
-        return len(b) <= 64 and all(_safe(k) for k in b)
+    if k == "container" and depth < 3:
+        items = v.keys() if type(v) is dict else v
+        return len(v) <= 64 and all(_deep_ok(x, depth + 1) for x in items)
     return False
 
 
-def _plain(v, depth=0):
-    t = type(v)
-    if t in PLAIN:
-        return not (t is float and v != v)
-    return t is tuple and depth < 3 and len(v) <= 16 and all(_plain(x, depth + 1) for x in v)
+def _eq_safe(a, b):
+    ka, kb = _kind(type(a)), _kind(type(b))
+    if "custom" in (ka, kb):
+        return False
+    if ka == "expr" and kb == "expr":
+        return type(a) is not type(b)  # same type would hash both trees
+    if ka == "container" and kb == "container":
+        return _deep_ok(a) and _deep_ok(b)
+    return True  # mismatched kinds: the comparison returns without user code
+
+
+def _order_safe(a, b):
+    ka, kb = _kind(type(a)), _kind(type(b))
+    if "custom" in (ka, kb):
+        return False
+    if ka == "container" or kb == "container":
+        return _deep_ok(a) and _deep_ok(b)
+    return True
+
+
+def _contain_safe(a, b):
+    tb = type(b)
+    if tb in (str, bytes):
+        return type(a) in (str, bytes) or _kind(type(a)) != "custom"
+    if tb in _CONTAINERS:
+        if len(b) > 64:
+            return False
+        if tb in (set, frozenset, dict):
+            # hashing a: builtin hashes only
+            if _kind(type(a)) not in ("plain", "builtin", "identity") and not (type(a) is tuple and _deep_ok(a)):
+                return False
+        return _deep_ok(b) and _kind(type(a)) != "custom" and (_kind(type(a)) != "container" or _deep_ok(a))
+    return False
 
 
 def _outcomes(a, b):
     out = []
-    contain = _container_ok(b)
+    eq = _eq_safe(a, b)
+    order = _order_safe(a, b)
+    contain = _contain_safe(a, b)
     for k, f in enumerate((lambda: a < b, lambda: a <= b, lambda: a > b, lambda: a >= b, lambda: a == b,
                            lambda: a != b, lambda: a is b, lambda: a is not b, lambda: a in b, lambda: a not in b)):
-        if k >= 8 and not contain:
-            out.append("?")  # containment would run user code: unknown
+        if (k < 4 and not order) or (k in (4, 5) and not eq) or (k >= 8 and not contain):
+            out.append("?")  # would run user code: unknown
             continue
         try:
             r = f()
@@ -178,6 +221,38 @@ def _outcomes(a, b):
         except Exception as e:  # noqa: BLE001
             out.append("E:" + type(e).__name__)
     return tuple(out)
+
+
+_NOKEY = object()
+_IDM = ("<obj>",)
+_HASHABLE_KINDS = ("plain", "builtin")
+
+
+def _part(v, k):
+    if k in ("identity", "expr"):
+        return _IDM
+    if k in _HASHABLE_KINDS:
+        try:
+            hash(v)
+        except TypeError:
+            return _NOKEY
+        return v
+    t = type(v)
+    if t is tuple or t is frozenset:
+        if len(v) <= 32 and all((_KIND.get(type(x)) or _kind(type(x))) in _HASHABLE_KINDS for x in v):
+            try:
+                hash(v)
+            except TypeError:
+                return _NOKEY
+            return v
+    return _NOKEY
+
+
+def _plain(v, depth=0):
+    t = type(v)
+    if t in PLAIN:
+        return not (t is float and v != v)
+    return t is tuple and depth < 3 and len(v) <= 16 and all(_plain(x, depth + 1) for x in v)
 
 
 def run_record(root, tests, out_dir, jobs):
@@ -205,9 +280,8 @@ def run_record(root, tests, out_dir, jobs):
            operator.is_, operator.is_not, lambda a, b: a in b, lambda a, b: a not in b)
     rec = {}  # site -> set of records, or "U"
 
-    plain_t = frozenset(PLAIN)
-    type_safe = {}
     U = "U"
+    sig_memo = {}
 
     def brv(sid, op, a, b):
         r = fns[op](a, b)
@@ -216,46 +290,50 @@ def run_record(root, tests, out_dir, jobs):
             return r
         ta = type(a)
         tb = type(b)
-        # a cheap key that fixes every outcome: the values for literals and
-        # hashable enum members, identity otherwise
-        if ta in plain_t and tb in plain_t:
-            k = (a, b)
+        ka = _KIND.get(ta) or _kind(ta)
+        kb = _KIND.get(tb) or _kind(tb)
+        # a key that fixes the outcomes, when one is cheap to form: literal
+        # values (and tuples of them) by value, other objects by identity
+        pa = _part(a, ka)
+        pb = _part(b, kb) if pa is not _NOKEY else _NOKEY
+        if pb is not _NOKEY:
+            key = (ta, tb, pa, pb, a is b)
+        elif pa is not _NOKEY and ka != "container" and kb == "container" and len(b) > 64:
+            # a scalar against a big container: containment is left unknown, and
+            # nothing else the comparison does looks inside b
+            key = (ta, tb, pa, "<big>", a is b)
         else:
-            sa = type_safe.get(ta)
-            if sa is None:
-                sa = type_safe[ta] = ta not in (tuple, list, dict, set, frozenset) and _safe_type(ta)
-            sb = type_safe.get(tb)
-            if sb is None:
-                sb = type_safe[tb] = tb not in (tuple, list, dict, set, frozenset) and _safe_type(tb)
-            if sa and sb:
-                k = (ta, tb, a is b, a if ta in plain_t or issubclass(ta, enum.Enum) else None,
-                     b if tb in plain_t or issubclass(tb, enum.Enum) else None)
-            elif (sa or ta in (tuple, frozenset)) and (sb or tb in (tuple, frozenset)):
-                try:
-                    k = (a, b)
-                    hash(k)
-                except TypeError:
-                    rec[sid] = U
-                    return r
-                if not (_safe(a) and _safe(b)):
-                    rec[sid] = U
-                    return r
-            else:
-                # containers we would have to scan, or user-defined comparisons
-                if (ta in (list, dict, set) or tb in (list, dict, set)) and _safe(a) and _safe(b):
-                    k = None
-                else:
-                    rec[sid] = U
-                    return r
+            key = None
+        sig = None
+        if key is not None:
+            try:
+                sig = sig_memo.get(key)
+            except TypeError:
+                key = None
+        if sig is None:
+            sig = _outcomes(a, b)
+            if key is not None:
+                if len(sig_memo) > 200000:
+                    sig_memo.clear()
+                sig_memo[key] = sig
         if cur is None:
-            cur = rec[sid] = {}
-        if k is not None and k in cur:
-            return r
-        if len(cur) >= CAP:
-            rec[sid] = U
-            return r
-        item = (_outcomes(a, b), (a, b) if _plain(a) and _plain(b) else None)
-        cur[k if k is not None else ("#", len(cur))] = item
+            cur = rec[sid] = [set(), set()]
+        sigs, pairs = cur
+        if sig not in sigs:
+            if len(sigs) >= SIG_CAP:
+                rec[sid] = U
+                return r
+            sigs.add(sig)
+        if pairs is not None:
+            if ka == "plain" and kb == "plain" and _plain(a) and _plain(b):
+                pr = (a, b)
+                if pr not in pairs:
+                    if len(pairs) >= PAIR_CAP:
+                        cur[1] = None
+                    else:
+                        pairs.add(pr)
+            else:
+                cur[1] = None  # a non-literal operand: constant edits cannot be judged
         return r
 
     builtins.__brv__ = brv
@@ -302,7 +380,8 @@ def run_record(root, tests, out_dir, jobs):
                     ok = res.testsRun > 0 and res.wasSuccessful()
                 except BaseException:  # noqa: BLE001
                     ok = False
-                payload = pickle.dumps({"ok": ok, "rec": {k: (v if v == "U" else frozenset(v.values())) for k, v in rec.items()}})
+                payload = pickle.dumps({"ok": ok, "rec": {k: (v if v == "U" else (frozenset(v[0]), None if v[1] is None else frozenset(v[1])))
+                                                         for k, v in rec.items()}})
                 with os.fdopen(w, "wb") as fh:
                     fh.write(payload)
                 os._exit(0)

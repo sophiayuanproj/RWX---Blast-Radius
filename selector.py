@@ -619,35 +619,32 @@ def comparison_edit(old_text, new_text):
 
 
 def _same_after(records, kind, info):
+    """records: (outcome signatures, literal operand pairs or None)."""
     import operator as _op
 
+    sigs, pairs = records
+    if not sigs:
+        return False
+    if kind == "op":
+        o, n = _CMP_OPS.index(info[0]), _CMP_OPS.index(info[1])
+        for sig in sigs:
+            if sig[n] not in (True, False) or sig[o] != sig[n]:
+                return False
+        return True
+    op, side, newc = info
+    if pairs is None or not pairs:
+        return False
     fns = {"Lt": _op.lt, "LtE": _op.le, "Gt": _op.gt, "GtE": _op.ge, "Eq": _op.eq, "NotEq": _op.ne,
            "In": lambda a, b: a in b, "NotIn": lambda a, b: a not in b}
-    for outcomes, pair in records:
-        if kind == "op":
-            o, n = info
-            if outcomes[_CMP_OPS.index(o)] != outcomes[_CMP_OPS.index(n)]:
-                return False
-            if outcomes[_CMP_OPS.index(n)] not in (True, False):
-                return False
-        else:
-            op, side, newc = info
-            if pair is None:
-                return False
-            old = outcomes[_CMP_OPS.index(op)]
-            if old not in (True, False):
-                return False
-            a, b = pair
-            if side == 0:
-                a = newc
-            else:
-                b = newc
-            try:
-                r = fns[op](a, b)
-            except Exception:  # noqa: BLE001
-                return False
-            if type(r) is not bool or r != old:
-                return False
+    f = fns[op]
+    for a, b in pairs:
+        try:
+            old = f(a, b)
+            new = f(newc, b) if side == 0 else f(a, newc)
+        except Exception:  # noqa: BLE001
+            return False
+        if type(old) is not bool or type(new) is not bool or old != new:
+            return False
     return True
 
 
@@ -678,7 +675,7 @@ def value_unaffected(ctx, path, edit, bits, file_lines):
                 continue
             drop |= 1 << n
             continue
-        if recs == "U" or not recs:
+        if recs == "U" or not isinstance(recs, tuple):
             continue
         if _same_after(recs, kind, info):
             drop |= 1 << n
