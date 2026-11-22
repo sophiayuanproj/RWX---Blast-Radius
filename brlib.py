@@ -266,7 +266,8 @@ def _doc_index(co):
 
 def shallow_sig(co):
     cls_body = (not is_function_code(co)) and "__firstlineno__" in co.co_names
-    doc = _doc_index(co)
+    # only a leading str constant can be a docstring: skip the bytecode scan otherwise
+    doc = _doc_index(co) if co.co_consts and type(co.co_consts[0]) is str else None
     return (
         co.co_code,
         co.co_names,

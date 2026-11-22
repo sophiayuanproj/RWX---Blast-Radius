@@ -164,7 +164,7 @@ def calibrate():
     was = gc.isenabled()
     gc.disable()
     try:
-        runs = sorted(bench() for _ in range(15))
+        runs = sorted(bench() for _ in range(6))
     finally:
         if was:
             gc.enable()
@@ -1242,7 +1242,7 @@ PARTIAL = float(os.environ.get("BR_PARTIAL", "0.25"))  # share of changed-execut
 PARTIAL_MIN = int(os.environ.get("BR_PARTIAL_MIN", "8"))
 
 
-PER_QUERY = os.environ.get("BR_PER_QUERY", "1") == "1"
+PER_QUERY = os.environ.get("BR_PER_QUERY", "0") == "1"
 
 
 def partial_cap(n_real):

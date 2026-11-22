@@ -424,105 +424,6 @@ class Hooks:
             plan_cpu[id(p)] = _t.process_time() - t0
             return p
 
-        # per query: the test parses each query and hands it to mp_execute
-        # (in a pool, synchronously here); both are module globals of the test
-        tmod = sys.modules.get(type(test).__module__)
-        fe = self.data.setdefault("fe", {})
-        fe_cpu = self.data.setdefault("fe_cpu", {})
-        if tmod is not None and hasattr(tmod, "mp_execute") and hasattr(tmod, "parse_one"):
-            orig_parse = tmod.parse_one
-            orig_mp = tmod.mp_execute
-            cur = {}
-
-            def parse_one(sql, *a, **kw):
-                import time as _t
-
-                if hooks.mode == "replay" and sql in hooks.skip_sqls:
-                    cur["sql"] = sql
-                    return Skipped(sql)
-                t0 = _t.process_time()
-                if hooks.mode == "record":
-                    with _LineRecorder() as rec:
-                        e = orig_parse(sql, *a, **kw)
-                    cur["lines"] = rec.lines
-                else:
-                    e = orig_parse(sql, *a, **kw)
-                cur["sql"] = sql
-                cur["t0"] = t0
-                return e
-
-            def mp_execute(expression, meta):
-                import time as _t
-
-                sql = cur.get("sql")
-                if isinstance(expression, Skipped):
-                    rec_ = fe.get(expression.sql) or {}
-                    k = rec_.get("key")
-                    if not meta.get("execute"):
-                        return None
-                    if k is None or k not in hooks.data["exec"]:
-                        raise Diverge("no recording for a skipped query")
-                    return pickle.loads(hooks.data["exec"][k])
-                if hooks.mode == "record":
-                    hooks.last_key = None
-                    with _LineRecorder() as rec:
-                        r = orig_mp(expression, meta)
-                    if sql is not None:
-                        fe[sql] = {"lines": frozenset(cur.get("lines", set()) | rec.lines),
-                                   "key": hooks.last_key}
-                    return r
-                r = orig_mp(expression, meta)
-                if sql is not None and "t0" in cur:
-                    fe_cpu[sql] = _t.process_time() - cur["t0"]
-                return r
-
-            import concurrent.futures as _cf
-
-            pool_cls = _cf.ProcessPoolExecutor
-            orig_submit = pool_cls.submit
-            fe_more = {}
-
-            def submit(self_, fn, *a, **kw):
-                if hooks.mode == "record" and getattr(fn, "__name__", "") == "mp_execute":
-                    with _LineRecorder() as rec:
-                        f = orig_submit(self_, fn, *a, **kw)
-                    sql = cur.get("sql")
-                    if sql is not None:
-                        fe_more.setdefault(sql, set()).update(rec.lines)
-                    return f
-                return orig_submit(self_, fn, *a, **kw)
-
-            cls_ = type(test)
-            orig_helper = cls_.__dict__.get("subtestHelper")
-
-            def subtestHelper(self_, i, table, tpch=True):
-                if hooks.mode != "record":
-                    return orig_helper(self_, i, table, tpch=tpch)
-                sql = (self_.tpch_sqls if tpch else self_.tpcds_sqls)[i][1]
-                with _LineRecorder() as rec:
-                    r = orig_helper(self_, i, table, tpch=tpch)
-                fe_more.setdefault(sql, set()).update(rec.lines)
-                return r
-
-            def finish_record():
-                for q, extra in fe_more.items():
-                    if q in fe:
-                        fe[q] = dict(fe[q], lines=frozenset(fe[q]["lines"] | extra))
-                fe_more.clear()
-
-            self._finish = finish_record
-            self._saved.append((pool_cls, "submit", orig_submit))
-            pool_cls.submit = submit
-            if orig_helper is not None:
-                self._saved.append((cls_, "subtestHelper", orig_helper))
-                cls_.subtestHelper = subtestHelper
-            mp_execute.__module__ = orig_mp.__module__
-            mp_execute.__qualname__ = orig_mp.__qualname__
-            mp_execute.__name__ = orig_mp.__name__
-            self._saved.append((tmod, "parse_one", orig_parse))
-            self._saved.append((tmod, "mp_execute", orig_mp))
-            tmod.parse_one = parse_one
-            tmod.mp_execute = mp_execute
         self._saved += [(ex, "optimize", ex.optimize), (py.PythonExecutor, "execute", orig_exec)]
         ex.optimize = optimize
         py.PythonExecutor.execute = execute
@@ -537,10 +438,7 @@ class Hooks:
                 setattr(cls, attr, _Conn(real, self.data["duck"], self.mode, self))
         self.spent = 0.0
         self.active = True
-        if self.mode == "record":
-            self._outer = _LineRecorder(outer=True)
-            self._outer.__enter__()
-            self._outer_test = test.id()
+
 
     def uninstall(self):
         outer = getattr(self, "_outer", None)
