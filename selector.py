@@ -19,6 +19,7 @@ import select
 import signal
 import sys
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1601,6 +1602,124 @@ def decide(ctx, a, max_local_ms=float("inf")):
     return blind_base + list(best[1]), list(best[2])
 
 
+# ------------------------------------------------------------ warm parent
+# The parent imports the pristine sqlglot and every test module once, before
+# forking. A child whose patch only edits function bodies installs the new
+# bytecode into the live function objects instead of importing everything
+# again (a cold import and first use cost tenths of a second per test file).
+# Any other patch drops the warm modules and imports the patched tree afresh.
+
+WARM = os.environ.get("BR_WARM", "1") == "1"
+WARM_LIVE = None  # (file, qualname, firstlineno) -> live function objects
+
+
+def warm_parent(tests):
+    global WARM_LIVE
+    import gc
+    import importlib
+    import types as _types
+
+    sys.path.insert(0, SRC)
+    import brfp
+    import brpool
+
+    brpool.install()
+    brfp.import_all()
+    for mod in sorted({t["file"][:-3].replace("/", ".") for t in tests}):
+        try:
+            importlib.import_module(mod)
+        except BaseException:  # noqa: BLE001
+            pass
+    prefix = os.path.join(SRC, "sqlglot") + os.sep
+    live = {}
+    for o in gc.get_objects():
+        if type(o) is _types.FunctionType:
+            c = o.__code__
+            f = c.co_filename
+            if f.startswith(prefix):
+                live.setdefault((os.path.relpath(f, SRC), c.co_qualname, c.co_firstlineno), []).append(o)
+    WARM_LIVE = live
+    sys.path.remove(SRC)
+
+
+def purge_warm():
+    """Forget the warm pristine modules: the patched tree is imported afresh."""
+    for k in list(sys.modules):
+        if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
+            del sys.modules[k]
+
+
+def _code_paths(co, path=()):
+    """(qualname, occurrence) paths of every code object under co."""
+    out = {}
+    counts = {}
+    for c in co.co_consts:
+        if isinstance(c, types.CodeType):
+            k = counts.get(c.co_qualname, 0)
+            counts[c.co_qualname] = k + 1
+            p = path + ((c.co_qualname, k),)
+            out[p] = c
+            out.update(_code_paths(c, p))
+    return out
+
+
+def swap_in(ctx, a):
+    """Install patched function bodies into the warm live functions. False when
+    the patch is not a pure function-body change this can express."""
+    if not (a.all_pkg_py and a.n_fps and a.fn_clean == a.n_fps and not a.need_fp and not a.must):
+        return False
+    plan = []
+    for rel, new_text in a.files.items():
+        if new_text is None or not rel.endswith(".py"):
+            return False
+        src_path = os.path.join(SRC, rel)
+        with open(src_path, encoding="utf-8") as f:
+            old_text = f.read()
+        old_co = compile(old_text, src_path, "exec")
+        new_co = compile(new_text, src_path, "exec")
+        changed, added, _moved = brlib.code_diff(old_co, new_co)
+        if added:
+            return False
+        old_paths = _code_paths(old_co)
+        new_paths = _code_paths(new_co)
+        by_obj = {id(c): p for p, c in old_paths.items()}
+        targets = set()
+        for co, kind in changed:
+            if kind != "self" or not brlib.is_function_code(co):
+                return False
+            p = by_obj.get(id(co))
+            if p is None:
+                return False
+            # the function and every enclosing function: an enclosing body holds
+            # the nested code as a constant
+            for i in range(1, len(p) + 1):
+                targets.add(p[:i])
+        for p in targets:
+            oc, nc = old_paths.get(p), new_paths.get(p)
+            if oc is None or nc is None:
+                return False
+            if not brlib.is_function_code(oc):
+                continue  # a class body: holds no code of its own at run time
+            key = (rel, oc.co_qualname, oc.co_firstlineno)
+            if key in ctx.import_codes:
+                return False  # ran at import: its results may be cached
+            if oc.co_freevars != nc.co_freevars:
+                return False
+            plan.append((key, nc))
+    if not plan:
+        return False
+    # every changed function must have a live object somewhere up its chain
+    n = 0
+    for key, nc in plan:
+        for fn in WARM_LIVE.get(key, ()):
+            fn.__code__ = nc
+            n += 1
+    if n == 0:
+        return False
+    a.note(f"warm: new bytecode in {n} live functions")
+    return True
+
+
 def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     def send(obj):
         data = (json.dumps(obj) + "\n").encode()
@@ -1614,6 +1733,15 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         a.note(f"overlay failed {e!r}")
         a.must |= ctx.all_bits
     os.chdir(root)
+    swapped = False
+    if WARM_LIVE is not None:
+        try:
+            swapped = swap_in(ctx, a)
+        except Exception as e:  # noqa: BLE001
+            a.note(f"swap failed {e!r}")
+            swapped = False
+        if not swapped:
+            purge_warm()
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
     for n, sqls in a.parse_checks:
@@ -1696,6 +1824,14 @@ def main():
     ctx = Ctx(maps, tests, speed)
     log(f"speed factor {speed:.2f}")
     preimport(maps)
+    if WARM:
+        try:
+            warm_parent(tests)
+            log(f"warm parent: {len(WARM_LIVE)} live sqlglot functions")
+        except Exception as e:  # noqa: BLE001
+            log(f"warm parent failed: {e!r}")
+            globals()["WARM_LIVE"] = None
+            purge_warm()
     if os.environ.get("BR_GC_FREEZE", "1") == "1":
         import gc
 
