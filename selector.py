@@ -41,7 +41,7 @@ HEAVY_PLANS = os.environ.get("BR_HEAVY_PLANS", "0") == "1"  # also try verifying
 SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
 ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "0") == "1"  # verify every candidate here (measurement)
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
-P_FAIL = float(os.environ.get("BR_P_FAIL", "0.25"))
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
 WORKER_COST = 2000  # ms
 EVAL = os.environ.get("BR_EVAL")  # path to answers.json: print diagnostics to stderr
 
@@ -447,6 +447,14 @@ def analyse_static(ctx, patch_text):
                     a.note(f"{path}:{co.co_qualname} {kind} -> {popcount(bits)}")
                     a.changed_lines |= {(path, l) for l in brlib.code_line_span(co)}
                     a.changed_lines.add((path, co.co_firstlineno))
+                if (VALUE_RULE and kind == "self" and in_pkg and len(changed) == 1 and not added
+                        and key not in ctx.import_codes and key not in ctx.order_sensitive):
+                    edit = comparison_edit(old_text, new_text)
+                    if edit is not None:
+                        drop = value_unaffected(ctx, path, edit, bits, file_lines)
+                        if drop:
+                            bits &= ~drop
+                            a.note(f"  comparison {edit[1]} {edit[2]}: {popcount(drop)} tests see the same outcome")
                 a.cands_fn |= bits
                 if key in ctx.import_codes:
                     a.need_fp = True
@@ -488,6 +496,193 @@ def fine_lines(si, co, hunk_lines):
         if lo <= l <= hi:
             out |= si.deciding_lines(l, lo, hi) or set(range(lo, hi + 1))
     return out
+
+
+# ---------------------------------------------------------- comparison values
+# build/value_record.py records, per test, how every comparison in sqlglot came
+# out (under each comparison operator) when the test ran alone. A patch whose
+# only change is one comparison's operator or one constant operand cannot
+# affect a test whose every recorded evaluation of it comes out the same.
+
+VALUES_DIR = os.path.join(MAPS, "values")
+_VALUES = {}
+_CMP_OPS = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq", "Is", "IsNot", "In", "NotIn")
+
+
+def _values_index():
+    if "index" not in _VALUES:
+        try:
+            with open(os.path.join(VALUES_DIR, "index.pkl"), "rb") as f:
+                d = pickle.load(f)
+            _VALUES["index"] = (frozenset(d["recorded"]), d["sites"])
+        except Exception:  # noqa: BLE001
+            _VALUES["index"] = None
+    return _VALUES["index"]
+
+
+def _values_shard(path):
+    if path not in _VALUES:
+        import hashlib
+
+        name = hashlib.sha1(path.encode()).hexdigest()[:16] + ".pkl"
+        try:
+            with open(os.path.join(VALUES_DIR, name), "rb") as f:
+                _VALUES[path] = pickle.load(f)
+        except Exception:  # noqa: BLE001
+            _VALUES[path] = {}
+    return _VALUES[path]
+
+
+def _single_diff(a, b, out):
+    """Collect differing (old, new) node pairs; False once the shapes differ
+    or more than one place differs."""
+    import ast as _ast
+
+    if type(a) is not type(b):
+        if isinstance(a, _ast.cmpop) and isinstance(b, _ast.cmpop):
+            return False  # handled at the comparison
+        out.append((a, b))
+        return len(out) <= 1
+    if isinstance(a, _ast.Compare) and [type(o) for o in a.ops] != [type(o) for o in b.ops]:
+        # an operator change: the rest of the comparison must be identical
+        if len(a.ops) != len(b.ops) or len(a.comparators) != len(b.comparators):
+            return False
+        sub = []
+        for p, q in zip([a.left] + a.comparators, [b.left] + b.comparators):
+            if not _single_diff(p, q, sub) or sub:
+                return False
+        out.append(("ops", a, b))
+        return len(out) <= 1
+    if isinstance(a, _ast.AST):
+        for f in a._fields:
+            x, y = getattr(a, f, None), getattr(b, f, None)
+            if isinstance(x, list) or isinstance(y, list):
+                if not (isinstance(x, list) and isinstance(y, list)) or len(x) != len(y):
+                    return False
+                for p, q in zip(x, y):
+                    if not _single_diff(p, q, out):
+                        return False
+            elif isinstance(x, _ast.AST) or isinstance(y, _ast.AST):
+                if not _single_diff(x, y, out):
+                    return False
+            elif x != y or type(x) is not type(y):
+                if isinstance(a, _ast.Constant) and f == "value":
+                    out.append((a, b))
+                    return len(out) <= 1
+                if f in ("kind",) and x is None and y is None:
+                    continue
+                return False
+        return True
+    if a != b or type(a) is not type(b):
+        return False
+    return True
+
+
+def comparison_edit(old_text, new_text):
+    """If the only change between two module sources is one single-operator
+    comparison (its operator, or a constant operand), describe it."""
+    import ast as _ast
+
+    try:
+        ta, tb = _ast.parse(old_text), _ast.parse(new_text)
+    except SyntaxError:
+        return None
+    out = []
+    if not _single_diff(ta, tb, out) or len(out) != 1:
+        return None
+    if out[0][0] == "ops":
+        _t, cx, cy = out[0]
+        if len(cx.ops) != 1:
+            return None
+        o, n = type(cx.ops[0]).__name__, type(cy.ops[0]).__name__
+        if o not in _CMP_OPS or n not in _CMP_OPS:
+            return None
+        return ((cx.lineno, cx.col_offset, cx.end_lineno, cx.end_col_offset), "op", (o, n))
+    x, y = out[0]
+    # otherwise: a constant directly under a comparison
+    def parent_compare(tree, node):
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Compare) and (n.left is node or node in n.comparators):
+                return n
+        return None
+
+    if isinstance(x, _ast.Constant) and isinstance(y, _ast.Constant):
+        cx, cy = parent_compare(ta, x), parent_compare(tb, y)
+        if cx is None or cy is None or len(cx.ops) != 1 or len(cy.ops) != 1:
+            return None
+        op = type(cx.ops[0]).__name__
+        if op in ("Is", "IsNot") or op not in _CMP_OPS:
+            return None
+        side = 0 if cx.left is x else 1
+        return ((cx.lineno, cx.col_offset, cx.end_lineno, cx.end_col_offset), "const", (op, side, y.value))
+    return None
+
+
+def _same_after(records, kind, info):
+    import operator as _op
+
+    fns = {"Lt": _op.lt, "LtE": _op.le, "Gt": _op.gt, "GtE": _op.ge, "Eq": _op.eq, "NotEq": _op.ne,
+           "In": lambda a, b: a in b, "NotIn": lambda a, b: a not in b}
+    for outcomes, pair in records:
+        if kind == "op":
+            o, n = info
+            if outcomes[_CMP_OPS.index(o)] != outcomes[_CMP_OPS.index(n)]:
+                return False
+            if outcomes[_CMP_OPS.index(n)] not in (True, False):
+                return False
+        else:
+            op, side, newc = info
+            if pair is None:
+                return False
+            old = outcomes[_CMP_OPS.index(op)]
+            if old not in (True, False):
+                return False
+            a, b = pair
+            if side == 0:
+                a = newc
+            else:
+                b = newc
+            try:
+                r = fns[op](a, b)
+            except Exception:  # noqa: BLE001
+                return False
+            if type(r) is not bool or r != old:
+                return False
+    return True
+
+
+def value_unaffected(ctx, path, edit, bits, file_lines):
+    """Tests among bits whose recorded evaluations of the edited comparison
+    all come out the same after the edit."""
+    idx = _values_index()
+    if idx is None:
+        return 0
+    recorded, sites = idx
+    site, kind, info = edit
+    if (path,) + site not in sites:
+        return 0
+    shard = _values_shard(path).get(site, {})
+    line = site[0]
+    drop = 0
+    for n in bits_list(bits):
+        if n >= ctx.n:
+            continue  # pseudo tests (regions of a replayed test)
+        tid = ctx.tests[n]["id"]
+        if tid not in recorded:
+            continue
+        recs = shard.get(tid)
+        if recs is None:
+            # never evaluated when run alone; kept if a full-suite run reached
+            # the line (a path only a warm cache takes)
+            if file_lines is not None and (file_lines.get(line, 0) >> n) & 1:
+                continue
+            drop |= 1 << n
+            continue
+        if recs == "U" or not recs:
+            continue
+        if _same_after(recs, kind, info):
+            drop |= 1 << n
+    return drop
 
 
 def narrow_by_lines(si, co, hunk_lines, file_lines):
@@ -1242,6 +1437,7 @@ PARTIAL = float(os.environ.get("BR_PARTIAL", "0.25"))  # share of changed-execut
 PARTIAL_MIN = int(os.environ.get("BR_PARTIAL_MIN", "8"))
 
 
+VALUE_RULE = os.environ.get("BR_VALUE_RULE", "1") == "1"
 PER_QUERY = os.environ.get("BR_PER_QUERY", "0") == "1"
 
 

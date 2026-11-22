@@ -21,7 +21,7 @@ RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot.tar.xz').extractall('/
  && rm /tmp/sqlglot.tar.xz
 
 COPY selector.py brlib.py brfp.py brpool.py brreplay.py /app/
-COPY build/record_replay.py /app/build/record_replay.py
+COPY build/record_replay.py build/value_record.py /app/build/
 COPY maps/maps.pkl.xz /app/maps/maps.pkl.xz
 
 # Bytecode for the pristine tree (the run's disk is read-only), then the
@@ -33,6 +33,7 @@ RUN python -c "import lzma, shutil; shutil.copyfileobj(lzma.open('/app/maps/maps
  && python -m compileall -q -j 4 sqlglot tests \
  && BR_MAPS_PKL=/app/maps/maps.pkl PYTHONPATH=/app/src python /app/brfp.py /app/maps/fp.pkl 1 2 3 4 5 \
  && (PYTHONPATH=/app/src python /app/build/record_replay.py /app/src /app/maps/replay.pkl || rm -f /app/maps/replay.pkl) \
+ && (timeout 420 python /app/build/value_record.py /app/src /app/maps/maps.pkl /app/maps/values 4 || rm -rf /app/maps/values) \
  && python -m compileall -q /app/selector.py /app/brlib.py /app/brfp.py /app/brpool.py /app/brreplay.py \
  && chmod -R a+rX /app
 
