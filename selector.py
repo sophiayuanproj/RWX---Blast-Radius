@@ -36,6 +36,7 @@ STATES = {}
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
+HEAVY_PLANS = os.environ.get("BR_HEAVY_PLANS", "0") == "1"  # also try verifying only heavy cheap tests
 SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
 ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "0") == "1"  # verify every candidate here (measurement)
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
@@ -1274,7 +1275,7 @@ def resolve_replay(ctx, a):
             real = {k for k, lines in cov.items() if lines & a.changed_lines}
         costs = [data.get("exec_cpu", {}).get(k, 0.0) for k in real]
         cap = partial_cap(len(real))
-        extra = sum(costs) if cap is None else sum(costs) * min(1.0, cap / len(costs))
+        extra = sum(costs) if cap is None else sum(costs) * min(1.0, 1.5 * cap / len(costs))
         # its query file edited: the few queries with new SQL run for real
         edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
         if edited and not LINKED_REPLAY:
@@ -1333,7 +1334,7 @@ def decide(ctx, a, max_local_ms=float("inf")):
                    key=lambda n: -(ms[n] - ctx.local_ms[n]))
     if os.environ.get("BR_DEBUG_DECIDE"):
         log(f"  heavy {[(ctx.tests[n]['id'].rsplit('::',1)[1], ms[n], int(ctx.local_ms[n])) for n in cands if ms[n] >= 2000]} must-heavy {[ctx.tests[n]['id'].rsplit('::',1)[1] for n in must if ms[n] >= 2000]}")
-    for k in range(1, min(3, len(heavy)) + 1):
+    for k in range(1, (min(3, len(heavy)) if HEAVY_PLANS else 0) + 1):
         loc = heavy[:k]
         if ctx.local_cost(loc) > max_local_ms:
             if os.environ.get("BR_DEBUG_DECIDE"):
