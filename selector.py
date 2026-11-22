@@ -33,7 +33,7 @@ PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
 STATES = {}
-LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
+LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "1") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
 SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
@@ -264,6 +264,7 @@ class Analysis:
         self.changed_lines = set()  # (path, old line) deciding those changes
         self.hunks_by_file = {}
         self.skip_reason = {}  # replayable test -> why no replay was possible
+        self.parse_checks = []  # (test, sqls): drop the test if all still parse
 
     def note(self, s):
         self.notes.append(s)
@@ -276,6 +277,7 @@ def analyse_static(ctx, patch_text):
     if not fps:
         a.note("empty patch")
         return a
+    a.py_in_patch = any((p or "").endswith(".py") for fp in fps for p in (fp.old_path, fp.new_path))
     for fp in fps:
         for p in {fp.old_path, fp.new_path} - {None}:
             bits = maps["open_tests"].get(p, 0)
@@ -1063,8 +1065,22 @@ def _fixture_pairs(text):
                 k, v = lines[j].split(":", 1)
                 meta.append((k.lstrip("#").strip(), v.strip()))
                 j += 1
+            if j == len(lines):
+                return None  # the loader itself would fail here
             out.append((tuple(meta), "\n".join(lines[j:]), stmts[i + 1].strip()))
     return out
+
+
+def _parses(sql):
+    try:
+        import sqlglot
+
+        sqlglot.parse_one(sql)
+        return True
+    except Exception as e:  # noqa: BLE001
+        if os.environ.get("BR_DEBUG_PARSE"):
+            log(f"parse check failed: {e!r}")
+        return False
 
 
 def fixture_unaffected_bits(ctx, a, path, fp):
@@ -1080,6 +1096,8 @@ def fixture_unaffected_bits(ctx, a, path, fp):
     if old is None or new is None:
         return 0
     affected = set()
+    parse_needed = {}
+    code_changed = a.py_in_patch
     for suffix, reads_expected in _FIXTURE_READERS[path]:
         if len(old) != len(new):
             affected.add(suffix)
@@ -1087,15 +1105,33 @@ def fixture_unaffected_bits(ctx, a, path, fp):
             if old != new:
                 affected.add(suffix)
         elif [(m, q) for m, q, _ in old] != [(m, q) for m, q, _ in new]:
-            affected.add(suffix)
+            # test_execute_* run only the pairs whose meta says "execute";
+            # the others are just parsed (parse_one) and their result unused
+            to_parse = []
+            for (m0, q0, _), (m1, q1, _) in zip(old, new):
+                if (m0, q0) == (m1, q1):
+                    continue
+                if m0 != m1 or dict(m1).get("execute") or code_changed:
+                    affected.add(suffix)
+                    break
+                to_parse.append(q1)
+            else:
+                # decided once the patched tree is importable (process_commit)
+                parse_needed.setdefault(suffix, []).extend(to_parse)
     readers = {sfx for rs in _FIXTURE_READERS.values() for sfx, _ in rs}
     out = 0
     for n, t in enumerate(ctx.tests):
         sfx = next((r for r in readers if t["id"].endswith(r)), None)
-        if sfx is not None and sfx not in affected:
+        if sfx is not None and sfx in parse_needed and sfx not in affected:
+            a.parse_checks.append((n, parse_needed[sfx]))
+        elif sfx is not None and sfx not in affected:
+            out |= 1 << n
+        elif sfx is None and t["id"].startswith("tests/test_executor.py::TestExecutor::"):
+            # the other tests of the class only share its setUpClass, which
+            # loads the pairs (it does not fail: the file still loads)
             out |= 1 << n
     if out:
-        a.note(f"{path}: executor tests reading unchanged fields dropped ({popcount(out)})")
+        a.note(f"{path}: executor tests reading unchanged fields dropped ({popcount(out)}); affected {sorted(affected)}")
     return out
 
 
@@ -1119,7 +1155,9 @@ def tag_tpcds(ctx, tests, cid, ws, st):
         if r:
             code = _SKIP_CODE.get(r, 7)
         elif any("replay test_execute_tpcds" in x for x in plan["notes"]):
-            code = 800  # replay possible, planner chose CI
+            # replay possible, planner chose CI; tens digit: its local estimate in 3 s steps
+            est = (plan.get("est") or {}).get(str(t_ds), 0) / 1000
+            code = 800 + 10 * max(1, min(9, -(-int(est) // 3)))
         else:
             code = 8  # no replay entry at all
     elif done is None:
@@ -1269,6 +1307,11 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     os.chdir(root)
     sys.path.insert(0, root)
     sys.dont_write_bytecode = True
+    for n, sqls in a.parse_checks:
+        if not a.py_in_patch and all(_parses(q) for q in sqls):
+            a.cands &= ~(1 << n)
+            a.data_cands &= ~(1 << n)
+            a.note(f"{ctx.tests[n]['id'].rsplit('::', 1)[1]}: edited queries are not executed and still parse: dropped")
     if a.need_fp:
         base = ctx.maps.get("base_import")
         if base is None or a.fp_modules is None or (a.fp_modules & base):
@@ -1286,7 +1329,8 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         a.note(f"local estimate {ctx.local_cost(local)/1000:.2f}s cpu; tests: " + ", ".join(
             ctx.tests[n]["id"].split("::", 1)[1] for n in sorted(local, key=lambda n: -ctx.local_ms[n])[:4]))
     send({"stage": "plan", "blind": blind, "local": local, "notes": a.notes,
-          "skip": {str(k): v for k, v in a.skip_reason.items()}})
+          "skip": {str(k): v for k, v in a.skip_reason.items()},
+          "est": {str(k): ctx.local_ms[k] for k in a.replay_mode}})
     failed = set()
     if local:
         failed = run_local(ctx, set(local), deadline, blind,
@@ -1440,10 +1484,6 @@ def main():
         if tag:
             try:
                 ws = tag_tpcds(ctx, tests, cid, ws, STATES.get(cid) or {})
-                if not speed_tagged and ws:
-                    # tens digit of the milliseconds: this machine's speed factor in halves
-                    ws = add_ms(ctx, ws, 10 * max(1, min(9, round(ctx.speed / 0.5))))
-                    speed_tagged = True
             except Exception as e:  # noqa: BLE001
                 log(f"tag failed {e!r}")
         print(json.dumps({"commit": cid, "workers": ws}))
