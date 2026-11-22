@@ -355,6 +355,7 @@ def run_record(root, tests, out_dir, jobs):
             pass
     rec.clear()  # import-time comparisons belong to no test
 
+    spool = tempfile.mkdtemp(prefix="brs_")
     results = {}
     running = {}
     pending = list(work)
@@ -382,15 +383,22 @@ def run_record(root, tests, out_dir, jobs):
                     ok = False
                 payload = pickle.dumps({"ok": ok, "rec": {k: (v if v == "U" else (frozenset(v[0]), None if v[1] is None else frozenset(v[1])))
                                                          for k, v in rec.items()}})
-                with os.fdopen(w, "wb") as fh:
+                os.close(w)
+                with open(os.path.join(spool, "%d.pkl" % os.getpid()), "wb") as fh:
                     fh.write(payload)
                 os._exit(0)
             os.close(w)
             running[pid] = (r, tid, bytearray())
         pid, _status = os.wait()
         r, tid, buf = running.pop(pid)
-        with os.fdopen(r, "rb") as fh:
-            data = fh.read()
+        os.close(r)
+        f = os.path.join(spool, "%d.pkl" % pid)
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read()
+            os.remove(f)
+        except OSError:
+            data = b""
         try:
             d = pickle.loads(data)
             results[tid] = d["rec"] if d["ok"] else None

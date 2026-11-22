@@ -293,6 +293,7 @@ class Analysis:
         self.skip_reason = {}  # replayable test -> why no replay was possible
         self.parse_checks = []  # (test, sqls): drop the test if all still parse
         self.infected = 0  # tests that certainly see a changed comparison outcome
+        self.order_hit = False  # a changed function's coverage depends on test order
         self.fn_clean = 0  # files whose only changes are function bodies
         self.n_fps = 0
         self.all_pkg_py = False
@@ -460,6 +461,8 @@ def analyse_static(ctx, patch_text):
                             bits &= ~drop
                             a.note(f"  comparison {edit[1]} {edit[2]}: {popcount(drop)} tests see the same outcome")
                 a.cands_fn |= bits
+                if key in ctx.order_sensitive:
+                    a.order_hit = True
                 if key in ctx.import_codes:
                     a.need_fp = True
                     _add_fp_module(a, mod, in_pkg)
@@ -1067,6 +1070,105 @@ class _Timeout(BaseException):
     pass
 
 
+# ------------------------------------------------------------ item slicing
+# build/item_record.py records, for tests that loop over a fixture file, the
+# sqlglot lines each fixture item runs and the lines the test runs outside any
+# item. A local check of such a test is fed only the items whose lines meet
+# the change, when the change is known line by line and misses the rest.
+
+ITEMS_DIR = os.path.join(MAPS, "items")
+ITEM_SLICING = os.environ.get("BR_ITEMS", "1") == "1"
+_ITEMS = {}
+SLICE = {}  # test number -> {fixture name: kept item indices}
+
+
+def _items_index():
+    if "index" not in _ITEMS:
+        try:
+            with open(os.path.join(ITEMS_DIR, "index.pkl"), "rb") as f:
+                _ITEMS["index"] = pickle.load(f)
+        except Exception:  # noqa: BLE001
+            _ITEMS["index"] = None
+    return _ITEMS["index"]
+
+
+def _items_test(name):
+    try:
+        with open(os.path.join(ITEMS_DIR, name), "rb") as f:
+            return pickle.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def plan_slices(ctx, a, nums):
+    """Fixture items worth running, per test, for this change (or nothing)."""
+    out = {}
+    if not (ITEM_SLICING and a.all_pkg_py and a.n_fps and a.fn_clean == a.n_fps and not a.need_fp
+            and not a.must and a.changed_lines and not a.order_hit):
+        return out
+    idx = _items_index()
+    if not idx:
+        return out
+    todo = [n for n in nums if ctx.tests[n]["id"] in idx["tests"]]
+    if not todo:
+        return out
+    fidx = {f: i for i, f in enumerate(idx["files"])}
+    changed = {(f, line): (fidx[f] * 1_000_000 + line if f in fidx else None) for f, line in a.changed_lines}
+    enc = {v for v in changed.values() if v is not None}
+    lt = ctx.maps.get("line_tests", {})
+    for n in todo:
+        rec = _items_test(idx["tests"][ctx.tests[n]["id"]])
+        if rec is None or rec["outer"] & enc:
+            continue  # the test's own code meets the change: run it whole
+        keep = {}
+        covered = set()
+        whole = False
+        for name, fx in rec["fixtures"].items():
+            if fx["all"] & enc:
+                whole = True  # every item runs a changed line
+                break
+            k = set()
+            for v in enc:
+                k.update(fx["inv"].get(v, ()))
+                if v in fx["inv"]:
+                    covered.add(v)
+            keep[name] = frozenset(k)
+        if whole:
+            continue
+        # a full-suite run that reached a changed line no recorded item (and
+        # not the test itself) ran: a path only warm caches take; run whole
+        ok = True
+        for (f, line), v in changed.items():
+            if (lt.get(f, {}).get(line, 0) >> n) & 1 and (v is None or (v not in covered and v not in rec["outer"])):
+                ok = False
+                break
+        if ok:
+            out[n] = keep
+    return out
+
+
+def install_slice(mod, keep):
+    """Wrap the fixture loaders seen by mod so only kept items come out."""
+    import tests.helpers as helpers
+
+    saved = []
+    for nm in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+        orig = getattr(helpers, nm)
+
+        def gen(name, *a, _orig=orig, **kw):
+            kept = keep.get(name)
+            for i, item in enumerate(_orig(name, *a, **kw)):
+                if kept is None or i in kept:
+                    yield item
+
+        saved.append((helpers, nm, orig))
+        setattr(helpers, nm, gen)
+        if mod is not None and getattr(mod, nm, None) is orig:
+            saved.append((mod, nm, orig))
+            setattr(mod, nm, gen)
+    return saved
+
+
 def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
     """Run tests (in tests.json order) in this process. Returns (failed set,
     not_run set)."""
@@ -1163,6 +1265,12 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
             n = id_to_num.get(test.id())
             if n is not None:
                 started.add(n)
+            self.slice_saved = None
+            if n in SLICE:
+                try:
+                    self.slice_saved = install_slice(sys.modules.get(type(test).__module__), SLICE[n])
+                except Exception:  # noqa: BLE001
+                    self.slice_saved = None
             if hooks is not None and n in replay:
                 try:
                     hooks.budget = REPLAY_BUDGET * tests[n]["seconds"] / ctx.speed
@@ -1194,11 +1302,16 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_PROF, 0)
+            for obj, nm, val in reversed(getattr(self, "slice_saved", None) or ()):
+                setattr(obj, nm, val)
+            self.slice_saved = None
             n = id_to_num.get(test.id())
             if hooks is not None and hooks.active:
                 hooks.uninstall()
             if n is not None:
                 completed.add(n)
+                if os.environ.get("BR_LOG_TESTCPU"):
+                    log(f"  testcpu {tests[n]['id']} {time.process_time() - self.t0:.3f} {'FAIL' if n in failed else 'ok'}")
             super().stopTest(test)
             if n in failed and not self.shouldStop:
                 # a worker is needed anyway now: maybe the rest is cheaper in CI
@@ -1776,6 +1889,10 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
     failed = set()
     if local:
         REPLAY_SKIP.update(a.replay_skip)
+        SLICE.update(plan_slices(ctx, a, local))
+        if SLICE and os.environ.get("BR_DEBUG_SLICE"):
+            log("  sliced: " + ", ".join(f"{ctx.tests[n]['id'].rsplit('::', 1)[1]} "
+                                          f"{sum(len(v) for v in k.values())} items" for n, k in SLICE.items()))
         failed = run_local(ctx, set(local), deadline, blind,
                            {t: r for t, r in a.replay_mode.items() if t in set(local)})
     send({"stage": "done", "failed": sorted(failed), "why": list(globals().get("LAST_WHY") or [])})
