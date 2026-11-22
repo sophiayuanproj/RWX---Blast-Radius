@@ -33,6 +33,7 @@ PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
 STATES = {}
+REPLAY_SKIP = {}
 LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
@@ -177,6 +178,18 @@ def calibrate():
 class Ctx:
     def __init__(self, maps, tests, speed=1.0):
         self.speed = speed
+        self.replay_sqls = {}
+        for tid, path in (("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+                           "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"),
+                          ("tests/test_executor.py::TestExecutor::test_execute_tpch",
+                           "tests/fixtures/optimizer/tpc-h/tpc-h.sql")):
+            try:
+                with open(os.path.join(SRC, path), encoding="utf-8") as f:
+                    pairs = _fixture_pairs(f.read())
+                if pairs:
+                    self.replay_sqls[tid] = [q for _m, q, _e in pairs]
+            except OSError:
+                pass
         self.maps = maps
         self.tests = tests
         self.n = len(tests)
@@ -277,6 +290,10 @@ class Analysis:
         self.hunks_by_file = {}
         self.skip_reason = {}  # replayable test -> why no replay was possible
         self.parse_checks = []  # (test, sqls): drop the test if all still parse
+        self.fn_clean = 0  # files whose only changes are function bodies
+        self.n_fps = 0
+        self.all_pkg_py = False
+        self.replay_skip = {}  # replayed test -> queries the change cannot reach
 
     def note(self, s):
         self.notes.append(s)
@@ -289,6 +306,9 @@ def analyse_static(ctx, patch_text):
     if not fps:
         a.note("empty patch")
         return a
+    a.n_fps = len(fps)
+    a.all_pkg_py = all((fp.path or "").startswith("sqlglot/") and (fp.path or "").endswith(".py")
+                       and fp.old_path == fp.new_path for fp in fps)
     a.py_in_patch = any((p or "").endswith(".py") for fp in fps for p in (fp.old_path, fp.new_path))
     for fp in fps:
         for p in {fp.old_path, fp.new_path} - {None}:
@@ -396,6 +416,8 @@ def analyse_static(ctx, patch_text):
                 a.must |= maps["module_import_tests"].get(mod, 0)
             continue
         changed, added, moved = brlib.code_diff(old_co, new_co)
+        if (in_pkg and not added and all(brlib.is_function_code(co) and kind == "self" for co, kind in changed)):
+            a.fn_clean += 1
         hunk_lines = brlib.changed_old_lines(fp.hunks)
         stmt_index = None
         file_lines = maps.get("line_tests", {}).get(path)
@@ -945,6 +967,7 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
                     hooks.abort = False
                     hooks.real_ok = 0
                     hooks.real_cap = partial_cap(len(rk))
+                    hooks.skip_sqls = REPLAY_SKIP.get(n, frozenset())
                     hooks.unknown_left = 3 * unk[0][1] if unk else 0
                     hooks.duck_left = 3 * unk[0][1] if unk else 0
                     hooks.install(test)
@@ -1219,6 +1242,9 @@ PARTIAL = float(os.environ.get("BR_PARTIAL", "0.25"))  # share of changed-execut
 PARTIAL_MIN = int(os.environ.get("BR_PARTIAL_MIN", "8"))
 
 
+PER_QUERY = os.environ.get("BR_PER_QUERY", "1") == "1"
+
+
 def partial_cap(n_real):
     if PARTIAL >= 1 or n_real <= PARTIAL_MIN:
         return None
@@ -1273,6 +1299,25 @@ def resolve_replay(ctx, a):
             if cov is None:
                 continue
             real = {k for k, lines in cov.items() if lines & a.changed_lines}
+        # queries whose recorded front-end+executor lines miss every changed
+        # line: their results come straight from the recording
+        fe = data.get("fe") or {}
+        fe_cpu = data.get("fe_cpu") or {}
+        fidx = {f: i for i, f in enumerate(data.get("fe_files") or ())}
+        changed_enc = frozenset(fidx[f] * 1_000_000 + l for f, l in a.changed_lines if f in fidx)
+        mine = ctx.replay_sqls.get(tid)
+        if (fe and mine and a.all_pkg_py and a.fn_clean == a.n_fps and not a.need_fp and not a.must
+                and a.changed_lines and PER_QUERY
+                and data.get("fe_files") is not None
+                and not ((data.get("fe_outer") or {}).get(tid.replace(".py::", ".").replace("/", ".").replace("::", "."), frozenset([-1])) & changed_enc)
+                and (data.get("fe_outer") or {}).get(tid.replace(".py::", ".").replace("/", ".").replace("::", ".")) is not None):
+            skip = {q for q in mine if q in fe and not (fe[q]["lines"] & changed_enc)}
+            if skip:
+                a.replay_skip[t] = frozenset(skip)
+                run_q = [q for q in mine if q not in skip]
+                cpu = sum(fe_cpu.get(q, 0.0) for q in run_q) + 0.05
+                real = {k for k in real if any((fe.get(q) or {}).get("key") == k for q in run_q)}
+                a.note(f"replay {tid.rsplit('::', 1)[1]}: {len(skip)}/{len(mine)} queries untouched by the change")
         costs = [data.get("exec_cpu", {}).get(k, 0.0) for k in real]
         cap = partial_cap(len(real))
         extra = sum(costs) if cap is None else sum(costs) * min(1.0, 1.5 * cap / len(costs))
@@ -1379,6 +1424,11 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
         except Exception as e:  # noqa: BLE001
             a.note(f"fp diff failed: {e!r}")
             a.cands |= ctx.all_bits
+    if os.environ.get("BR_DUMP"):
+        with open(os.path.join(os.environ["BR_DUMP"], cid + ".json"), "w") as f:
+            json.dump({"cands": bits_list(a.cands & ((1 << ctx.n) - 1)), "fn": bits_list(a.cands_fn & ((1 << ctx.n) - 1)),
+                       "must": bits_list(a.must & ((1 << ctx.n) - 1)), "data": bits_list(a.data_cands & ((1 << ctx.n) - 1)),
+                       "need_fp": bool(a.need_fp), "files": list(a.files), "notes": a.notes}, f)
     a.replay_mode = resolve_replay(ctx, a)
     # local work must fit well inside this commit's share of the time limit
     blind, local = decide(ctx, a, max_local_ms=max(0.0, (deadline - time.monotonic()) * 1000 * 0.6))
@@ -1390,6 +1440,7 @@ def process_commit(ctx, cid, patch_text, pristine, out_fd, deadline):
           "est": {str(k): ctx.local_ms[k] for k in a.replay_mode}})
     failed = set()
     if local:
+        REPLAY_SKIP.update(a.replay_skip)
         failed = run_local(ctx, set(local), deadline, blind,
                            {t: r for t, r in a.replay_mode.items() if t in set(local)})
     send({"stage": "done", "failed": sorted(failed), "why": list(globals().get("LAST_WHY") or [])})

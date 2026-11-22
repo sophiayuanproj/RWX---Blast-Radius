@@ -90,6 +90,20 @@ if ok:
     data["cpu"] = {tid: cpu2.get(tid.replace("/", ".").replace(".py::", ".").replace("::", "."), 0.0)
                    for tid in brreplay.REPLAY_TESTS}
     data["light_setup_cpu"] = setup2
+# compact the per-query line sets: (file, line) -> file index * 1_000_000 + line
+files = sorted({f for v in data.get("fe", {}).values() for f, _l in v["lines"]}
+               | {f for v in data.get("fe_outer", {}).values() for f, _l in v})
+fidx = {f: i for i, f in enumerate(files)}
+
+
+def enc(lines):
+    return frozenset(fidx[f] * 1_000_000 + l for f, l in lines)
+
+
+if data.get("fe") and not data.get("fe_files"):
+    data["fe"] = {q: dict(v, lines=enc(v["lines"])) for q, v in data["fe"].items()}
+    data["fe_outer"] = {k: enc(v) for k, v in data.get("fe_outer", {}).items()}
+    data["fe_files"] = files
 with open(out, "wb") as f:
     pickle.dump(data, f)
 sys.exit(0 if ok else 1)
