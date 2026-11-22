@@ -1274,7 +1274,7 @@ def resolve_replay(ctx, a):
             real = {k for k, lines in cov.items() if lines & a.changed_lines}
         costs = [data.get("exec_cpu", {}).get(k, 0.0) for k in real]
         cap = partial_cap(len(real))
-        extra = sum(costs) if cap is None else sum(costs) * min(1.0, 1.5 * cap / len(costs))
+        extra = sum(costs) if cap is None else sum(costs) * min(1.0, cap / len(costs))
         # its query file edited: the few queries with new SQL run for real
         edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
         if edited and not LINKED_REPLAY:
@@ -1327,6 +1327,24 @@ def decide(ctx, a, max_local_ms=float("inf")):
             cost = expected_local(ctx, a, blind, order[j:])
             if cost < best[0]:
                 best = (cost, order[:j], order[j:])
+    # verify only the few heavy tests that are cheap to check here (a replayed
+    # executor test among hundreds of small candidates), the rest to CI
+    heavy = sorted((n for n in cands if ms[n] >= 2000 and ctx.local_ms[n] < ms[n] * 1.5),
+                   key=lambda n: -(ms[n] - ctx.local_ms[n]))
+    if os.environ.get("BR_DEBUG_DECIDE"):
+        log(f"  heavy {[(ctx.tests[n]['id'].rsplit('::',1)[1], ms[n], int(ctx.local_ms[n])) for n in cands if ms[n] >= 2000]} must-heavy {[ctx.tests[n]['id'].rsplit('::',1)[1] for n in must if ms[n] >= 2000]}")
+    for k in range(1, min(3, len(heavy)) + 1):
+        loc = heavy[:k]
+        if ctx.local_cost(loc) > max_local_ms:
+            if os.environ.get("BR_DEBUG_DECIDE"):
+                log(f"  heavy plan over limit: {ctx.local_cost(loc)/1000:.1f} > {max_local_ms/1000:.1f}")
+            continue
+        rest = [n for n in cands if n not in set(loc)]
+        cost = expected_local(ctx, a, blind_base + rest, loc)
+        if os.environ.get("BR_DEBUG_DECIDE"):
+            log(f"  heavy plan {[ctx.tests[n]['id'].rsplit('::',1)[1] for n in loc]}: {cost/1000:.2f} vs {best[0]/1000:.2f}; local {ctx.local_cost(loc)/1000:.2f} limit {max_local_ms/1000:.1f}")
+        if cost < best[0]:
+            best = (cost, rest, loc)
     return blind_base + list(best[1]), list(best[2])
 
 
@@ -1421,7 +1439,7 @@ def main():
     commits = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
     n = len(commits)
     global_deadline = t_start + PER_COMMIT_WALL * n / max(1, PARALLEL) * PARALLEL / 2 + 5
-    global_deadline = t_start + max(20.0, PER_COMMIT_WALL * n)
+    global_deadline = t_start + max(20.0, min(PER_COMMIT_WALL * n, float(os.environ.get("BR_WALL_CAP", "150"))))
     os.makedirs(WORK, exist_ok=True)
 
     results = {}
