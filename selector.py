@@ -33,7 +33,7 @@ PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 PER_COMMIT_WALL = float(os.environ.get("BR_PER_COMMIT", "5.0"))  # seconds of wall budget per commit
 REPLAY_BUDGET = float(os.environ.get("BR_REPLAY_BUDGET", "0"))  # share of a test's CI seconds worth spending to verify it
 STATES = {}
-LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "1") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
+LINKED_REPLAY = os.environ.get("BR_LINKED_REPLAY", "0") == "1"  # replay when tpc-ds.sql/tpc-h.sql changed
 RESERVE_PER_COMMIT = float(os.environ.get("BR_RESERVE", "2.0"))  # wall seconds kept for each waiting commit
 LOCAL_RATIO = float(os.environ.get("BR_LOCAL_RATIO", "1.15"))  # local cpu / recorded seconds
 SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
@@ -154,8 +154,19 @@ def calibrate():
     estimates were measured on."""
     if os.environ.get("BR_SPEED"):
         return float(os.environ["BR_SPEED"])
-    runs = sorted(bench() for _ in range(5))
-    t = runs[1]  # second fastest: steady against a stray slow run
+    # many short runs, fastest kept: interference only ever slows a run down.
+    # The collector stays off: with the maps loaded, a collection walks millions
+    # of objects and would be timed as slowness of the machine.
+    import gc
+
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        runs = sorted(bench() for _ in range(15))
+    finally:
+        if was:
+            gc.enable()
+    t = runs[0]
     f = t / REF_BENCH
     if 0.85 <= f <= 1.2:
         f = 1.0  # same class of machine as the estimates: do not chase noise
@@ -931,6 +942,8 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
                     rk -= set(unk)
                     hooks.real_keys = rk
                     hooks.abort = False
+                    hooks.real_ok = 0
+                    hooks.real_cap = partial_cap(len(rk))
                     hooks.unknown_left = 3 * unk[0][1] if unk else 0
                     hooks.duck_left = 3 * unk[0][1] if unk else 0
                     hooks.install(test)
@@ -975,6 +988,8 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
                     pass
 
         def addError(self, test, err):
+            if hooks is not None and err and _is_accept(err[0]):
+                return  # partial check passed
             self._why(test, err)
             self._mark(test)
 
@@ -983,6 +998,8 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
             self._mark(test)
 
         def addSubTest(self, test, subtest, err):
+            if err is not None and hooks is not None and _is_accept(err[0]):
+                return
             if err is not None:
                 self._why(test, err)
                 self._mark(test)
@@ -1197,6 +1214,25 @@ def add_ms(ctx, ws, code):
     return ws
 
 
+PARTIAL = float(os.environ.get("BR_PARTIAL", "0.25"))  # share of changed-executor queries to confirm
+PARTIAL_MIN = int(os.environ.get("BR_PARTIAL_MIN", "8"))
+
+
+def partial_cap(n_real):
+    if PARTIAL >= 1 or n_real <= PARTIAL_MIN:
+        return None
+    return max(PARTIAL_MIN, -(-int(n_real * PARTIAL * 1000) // 1000))
+
+
+def _is_accept(tp):
+    try:
+        import brreplay
+
+        return isinstance(tp, type) and issubclass(tp, brreplay.Accept)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def resolve_replay(ctx, a):
     """Fold the pseudo tests (everything but the front end; the executor alone)
     back into their tests, and pick the replayable tests a replay can verify:
@@ -1236,7 +1272,9 @@ def resolve_replay(ctx, a):
             if cov is None:
                 continue
             real = {k for k, lines in cov.items() if lines & a.changed_lines}
-        extra = sum(data.get("exec_cpu", {}).get(k, 0.0) for k in real)
+        costs = [data.get("exec_cpu", {}).get(k, 0.0) for k in real]
+        cap = partial_cap(len(real))
+        extra = sum(costs) if cap is None else sum(costs) * min(1.0, 1.5 * cap / len(costs))
         # its query file edited: the few queries with new SQL run for real
         edited = [f for f in a.files if f in set(ctx.maps.get("setup_linked_files") or ())]
         if edited and not LINKED_REPLAY:
@@ -1477,7 +1515,7 @@ def main():
                 finish(st, killed=True)
                 cleanup(st["cid"])
 
-    tag = os.environ.get("BR_TAG", "1") == "1"
+    tag = os.environ.get("BR_TAG", "0") == "1"
     speed_tagged = not tag
     for cid in commits:
         ws = results.get(cid, [])

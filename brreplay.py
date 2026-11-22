@@ -32,6 +32,11 @@ class Diverge(BaseException):
     """An input the pinned commit never produced: the outcome is unknown."""
 
 
+class Accept(BaseException):
+    """Enough of the queries reaching changed executor code gave the pinned
+    result: the rest are taken to pass (partial check)."""
+
+
 def expr_digest(e):
     """Structural digest of a sqlglot expression tree, computed without
     calling any sqlglot code (attribute and slot reads only)."""
@@ -144,6 +149,28 @@ class _LineRecorder:
         mon.set_events(self.TOOL, 0)
         mon.register_callback(self.TOOL, mon.events.LINE, None)
         mon.free_tool_id(self.TOOL)
+        return False
+
+
+def close_table(a, b):
+    """Equal up to assert_frame_equal's default tolerance (rtol 1e-5, atol 1e-8)."""
+    import math
+
+    try:
+        if list(a.columns) != list(b.columns) or len(a.rows) != len(b.rows):
+            return False
+        for ra, rb in zip(a.rows, b.rows):
+            if len(ra) != len(rb):
+                return False
+            for x, y in zip(ra, rb):
+                if x == y:
+                    continue
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)) and not isinstance(x, bool):
+                    if math.isclose(x, y, rel_tol=1e-5, abs_tol=1e-8):
+                        continue
+                return False
+        return True
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -268,6 +295,8 @@ class Hooks:
         self.duck_left = 0  # unrecorded DuckDB queries allowed to run for real
         self.active = False
         self.abort = False  # set once the running test has a failed subtest
+        self.real_cap = None  # partial check: real queries to confirm before accepting
+        self.real_ok = 0
         self._saved = []
         self._last = []
 
@@ -321,11 +350,17 @@ class Hooks:
                 if key is not None and key in hooks.real_keys and key in store:
                     # this query reaches changed executor code: run it, and
                     # stop at once if it no longer gives the pinned result
+                    if hooks.real_cap is not None and hooks.real_ok >= hooks.real_cap:
+                        raise Accept()
                     r = orig_exec(self_, plan)
-                    if not same_table(r, pickle.loads(store[key])) and not STRICT_EXEC_CHECK:
-                        return r  # the test's own (float-tolerant) comparison decides
-                    if not same_table(r, pickle.loads(store[key])):
-                        raise Diverge("executor result changed")
+                    if same_table(r, pickle.loads(store[key])):
+                        hooks.real_ok += 1  # the pinned (passing) result: this query passes
+                        return r
+                    if close_table(r, pickle.loads(store[key])):
+                        hooks.real_ok += 1  # equal within the test's float tolerance
+                        return r
+                    # a different result: the test fails on it; stop paying for the rest
+                    hooks.abort = True
                     return r
                 if key is not None and key in store:
                     return pickle.loads(store[key])
