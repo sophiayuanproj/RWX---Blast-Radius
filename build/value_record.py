@@ -409,9 +409,12 @@ def run_record(root, tests, out_dir, jobs):
             by_file.setdefault(path, {}).setdefault((l0, c0, l1, c1), {})[tid] = v
     os.makedirs(out_dir, exist_ok=True)
     for path, d in by_file.items():
-        name = hashlib.sha1(path.encode()).hexdigest()[:16] + ".pkl"
-        with open(os.path.join(out_dir, name), "wb") as fh:
-            pickle.dump(d, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        # one small file per comparison site: a run loads only the one it needs
+        sub = os.path.join(out_dir, hashlib.sha1(path.encode()).hexdigest()[:16])
+        os.makedirs(sub, exist_ok=True)
+        for site, tv in d.items():
+            with open(os.path.join(sub, "%d_%d_%d_%d.pkl" % site), "wb") as fh:
+                pickle.dump(tv, fh, protocol=pickle.HIGHEST_PROTOCOL)
     with open(os.path.join(out_dir, "index.pkl"), "wb") as fh:
         pickle.dump({"recorded": sorted(t for t, v in results.items() if v is not None),
                      "sites": {(s[0], s[1], s[2], s[3], s[4]): s[5] for s in sites}}, fh)

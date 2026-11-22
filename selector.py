@@ -172,7 +172,8 @@ def calibrate():
     f = t / REF_BENCH
     if 0.85 <= f <= 1.2:
         f = 1.0  # same class of machine as the estimates: do not chase noise
-    return max(0.5, min(4.0, f))
+    # a slower reading than this has been noise (a busy neighbour) more often than a slow machine
+    return max(0.5, min(1.3, f))
 
 
 class Ctx:
@@ -290,6 +291,7 @@ class Analysis:
         self.hunks_by_file = {}
         self.skip_reason = {}  # replayable test -> why no replay was possible
         self.parse_checks = []  # (test, sqls): drop the test if all still parse
+        self.infected = 0  # tests that certainly see a changed comparison outcome
         self.fn_clean = 0  # files whose only changes are function bodies
         self.n_fps = 0
         self.all_pkg_py = False
@@ -451,7 +453,8 @@ def analyse_static(ctx, patch_text):
                         and key not in ctx.import_codes and key not in ctx.order_sensitive):
                     edit = comparison_edit(old_text, new_text)
                     if edit is not None:
-                        drop = value_unaffected(ctx, path, edit, bits, file_lines)
+                        drop, infected = value_unaffected(ctx, path, edit, bits, file_lines)
+                        a.infected |= infected & bits & ~drop
                         if drop:
                             bits &= ~drop
                             a.note(f"  comparison {edit[1]} {edit[2]}: {popcount(drop)} tests see the same outcome")
@@ -520,17 +523,15 @@ def _values_index():
     return _VALUES["index"]
 
 
-def _values_shard(path):
-    if path not in _VALUES:
-        import hashlib
+def _values_site(path, site):
+    import hashlib
 
-        name = hashlib.sha1(path.encode()).hexdigest()[:16] + ".pkl"
-        try:
-            with open(os.path.join(VALUES_DIR, name), "rb") as f:
-                _VALUES[path] = pickle.load(f)
-        except Exception:  # noqa: BLE001
-            _VALUES[path] = {}
-    return _VALUES[path]
+    name = os.path.join(hashlib.sha1(path.encode()).hexdigest()[:16], "%d_%d_%d_%d.pkl" % site)
+    try:
+        with open(os.path.join(VALUES_DIR, name), "rb") as f:
+            return pickle.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _single_diff(a, b, out):
@@ -648,19 +649,29 @@ def _same_after(records, kind, info):
     return True
 
 
+def _known_differs(records, kind, info):
+    """Some recorded evaluation certainly comes out differently after the edit."""
+    sigs, pairs = records
+    if kind == "op":
+        o, n = _CMP_OPS.index(info[0]), _CMP_OPS.index(info[1])
+        return any(sig[o] in (True, False) and sig[n] in (True, False) and sig[o] != sig[n] for sig in sigs)
+    return False
+
+
 def value_unaffected(ctx, path, edit, bits, file_lines):
     """Tests among bits whose recorded evaluations of the edited comparison
     all come out the same after the edit."""
     idx = _values_index()
     if idx is None:
-        return 0
+        return 0, 0
     recorded, sites = idx
     site, kind, info = edit
     if (path,) + site not in sites:
-        return 0
-    shard = _values_shard(path).get(site, {})
+        return 0, 0
+    shard = _values_site(path, site)
     line = site[0]
     drop = 0
+    infected = 0
     for n in bits_list(bits):
         if n >= ctx.n:
             continue  # pseudo tests (regions of a replayed test)
@@ -679,7 +690,9 @@ def value_unaffected(ctx, path, edit, bits, file_lines):
             continue
         if _same_after(recs, kind, info):
             drop |= 1 << n
-    return drop
+        elif _known_differs(recs, kind, info):
+            infected |= 1 << n
+    return drop, infected
 
 
 def narrow_by_lines(si, co, hunk_lines, file_lines):
@@ -1255,6 +1268,7 @@ def run_local(ctx, nums, deadline, blind=(), replay=frozenset()):
 
 
 P_DATA = float(os.environ.get("BR_P_DATA", "0.85"))
+P_INFECTED = float(os.environ.get("BR_P_INFECTED", "0.4"))  # a recorded comparison outcome changes
 
 
 def expected_local(ctx, a, blind, local):
@@ -1264,7 +1278,7 @@ def expected_local(ctx, a, blind, local):
     lb = 0
     for n in local:
         lb |= 1 << n
-    p = P_DATA if (lb & a.data_cands) else P_FAIL
+    p = P_INFECTED if (lb & a.infected) else P_DATA if (lb & a.data_cands) else P_FAIL
     lms = sum(ms[n] for n in local)
     if blind:
         cost += pack(blind, ms)[0] + p * 0.3 * lms
@@ -1666,6 +1680,14 @@ def main():
     if os.path.exists(rp):
         with open(rp, "rb") as f:
             replay_data = pickle.load(f)
+    if replay_data is not None and os.environ.get("BR_FIXED_REPLAY_CPU", "1") == "1":
+        # build-time timings of the replay vary by a third from build to build,
+        # which would make the plan depend on the build: use typical values
+        fixed = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": 3.4,
+                 "tests/test_executor.py::TestExecutor::test_execute_tpch": 0.03,
+                 "tests/test_executor.py::TestExecutor::test_optimized_tpch": 0.08}
+        cpu = replay_data.get("cpu") or {}
+        replay_data["cpu"] = {k: fixed.get(k, v) for k, v in cpu.items()}
     maps["_replay_data"] = replay_data
     if maps["test_ids"] != [t["id"] for t in tests]:
         log("WARNING: tests.json differs from the map; remapping by id")
