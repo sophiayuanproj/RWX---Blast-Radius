@@ -41,7 +41,7 @@ HEAVY_PLANS = os.environ.get("BR_HEAVY_PLANS", "0") == "1"  # also try verifying
 SUFFIX_PLANS = os.environ.get("BR_SUFFIX_PLANS", "0") == "1"  # also try verifying only the costly tests
 ALL_LOCAL = os.environ.get("BR_ALL_LOCAL", "0") == "1"  # verify every candidate here (measurement)
 LOCAL_FIXED = float(os.environ.get("BR_LOCAL_FIXED", "0.25"))  # cpu to start running tests at all
-P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.25"))
 WORKER_COST = 2000  # ms
 EVAL = os.environ.get("BR_EVAL")  # path to answers.json: print diagnostics to stderr
 
